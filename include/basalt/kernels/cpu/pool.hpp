@@ -186,6 +186,9 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    /// How a parked worker waits for the next batch (--exp umwait=N, where the processor has WAITPKG): 0 pauses at full
+    /// clock; 2 waits in C0.2 and 1 in C0.1, light sleeps the core leaves when the host writes `epoch_`'s line.
+    int umwait_ = 0;
     std::vector<std::thread> threads_;
     // idle work (mode 7): one job per worker index
     IdleFn idle_fn_ = nullptr;
