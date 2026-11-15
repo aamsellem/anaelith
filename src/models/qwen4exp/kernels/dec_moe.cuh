@@ -414,11 +414,20 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
 constexpr int kDmGlueExperts = 1024;   // expert ids the mask table covers
 constexpr int kDmGlueTokens = 16;      // tokens a mask holds
 
-template<int TG, int TU = TG>
-__global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L,
+constexpr int kDmGlueStage = 6;   // XS: the entries of a group whose activation rows the block stages
+
+// XS 1: a group's activation rows are copied to shared memory once an item, where a lane's q8_1 block is nine words
+// from the next lane's, so the 32 lanes of a load fall in 32 banks; the rows then read them there instead of one
+// sector a lane from the global copy.  The same words.
+// PF 1 or 2: while an item's rows are computed the warp asks for the next item's two rows (into L1 or L2), one line a
+// lane, so its loads find them instead of waiting for VRAM.
+template<int TG, int TU = TG, int MB = 2, int NCX = 6, int GS = 0, int XS = 0, int PF = 0, bool ROLL = false>
+__global__ void __launch_bounds__(256, MB) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L,
                                                             float* __restrict__ gate, float* __restrict__ up,
                                                             block_q8_1* __restrict__ hq) {
     __shared__ int32_t s_ids[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
+    __shared__ int32_t s_slot[XS ? kDmCap : 1];                           // an entry's place in its group
+    __shared__ alignas(16) block_q8_1 s_x[XS ? kDmGlueStage * 80 : 1];   // the staged rows, entry by entry
     __shared__ unsigned long long s_ptr[kDmCap];
     __shared__ uint32_t s_tab[kDmGlueExperts];
     __shared__ int2 s_wtot[4];
@@ -445,7 +454,9 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     if (tid == 0) dm_landed_read(a, lw_need, lw_have);
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
     if (tid == 0) s_dup = 0;
-    const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
+    // GS 1: the grid read from the device table (the same words) instead of the block's shared copy
+    const uint32_t* s_grid = GS != 0 && gu2::table_grid<TG>() != nullptr ? gu2::table_grid<TG>()
+                                                                          : gu2::stage_grid<TG>(s_grid_buf, tid);
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
@@ -493,7 +504,10 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
         s_ptr[gi] = praw;
         s_start[gi] = gs;
         int r = 0;
-        for (uint32_t m = bits; m != 0u; m &= m - 1u) s_tok[gs + r++] = __ffs(m) - 1;   // the group's tokens in order
+        for (uint32_t m = bits; m != 0u; m &= m - 1u) {   // the group's tokens in order
+            if constexpr (XS != 0) s_slot[gs + r] = r;
+            s_tok[gs + r++] = __ffs(m) - 1;
+        }
         s_tab[e0] = bits | (uint32_t) gs << 16;   // the group's start, for the lead block's places
     }
     if (tid == 0) s_start[ng] = ne;
@@ -518,28 +532,68 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     const int nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
     const int items = nx * ng;   // one (row block, group) item each: every group's rows spread over all blocks
     const auto* xq = (const block_q8_1*) a.xq;
+    int staged = -1;   // XS: the group whose rows s_x holds
     for (int it = blockIdx.x; it < items; it += nwork) {
-        const int bx = it % nx, g = it / nx;
+        // XS 2: a block's items go group by group where the blocks divide into the groups, so it stages a group once
+        const int bx = XS == 2 ? it / ng : it % nx, g = XS == 2 ? it % ng : it / nx;
         const int row = bx * GU2_ROWS + 2 * warp;   // rows row, row + 1: both gate or both up
+        if constexpr (PF != 0) {
+            const int itn = it + nwork;
+            if (itn < items) {
+                const int rown = (itn % nx) * GU2_ROWS + 2 * warp;
+                const bool upn = rown >= (int) L.n_ff;
+                const int rbn = (int) (upn ? L.up_row : L.gu_row);
+                const uint8_t* wn = (const uint8_t*) s_ptr[itn / nx] + (upn ? L.up_off : 0) +
+                                    (size_t) (upn ? rown - (int) L.n_ff : rown) * rbn;
+                for (int o = lane * 128; o < 2 * rbn; o += 32 * 128) {
+                    if constexpr (PF == 1) asm volatile("prefetch.global.L1 [%0];" ::"l"(wn + o));
+                    else asm volatile("prefetch.global.L2 [%0];" ::"l"(wn + o));
+                }
+            }
+        }
+        if constexpr (XS != 0) {
+            const int e0 = s_start[g], ne_g = s_start[g + 1] - e0;
+            if (ne_g <= kDmGlueStage && L.n_embd == 2560) {
+                constexpr int kWords = 80 * (int) (sizeof(block_q8_1) / sizeof(uint32_t));   // an entry's words
+                if (staged != g) {
+                    __syncthreads();   // the warps are done with the item before
+                    for (int i = tid; i < ne_g * kWords; i += 256) {
+                        const int c = i / kWords, w = i - c * kWords;
+                        ((uint32_t*) s_x)[i] = __ldg((const uint32_t*) (xq + (size_t) s_tok[e0 + c] * 80) + w);
+                    }
+                    __syncthreads();
+                    staged = g;
+                }
+                if (row < 2 * L.n_ff)
+                    gu2::pair_gu<TG, TU, 80, NCX, ROLL>((const uint8_t*) s_ptr[g], row, e0, e0 + ne_g, s_slot,
+                                                  (const block_q8_1*) s_x, L, gate, up, s_grid, lane);
+                continue;
+            }
+        }
         if (row < 2 * L.n_ff)
-            gu2::pair_gu<TG, TU>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up,
-                                 s_grid, lane);
+            gu2::pair_gu<TG, TU, 80, NCX, ROLL>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate,
+                                          up, s_grid, lane);
     }
 }
 
 // co-resident blocks on the current device, an eighth of the SMs left to the side streams (shared expert, ring)
-template<int TG, int TU = TG> int dm_glue_blocks() {
+template<int TG, int TU = TG, int MB = 2, int NCX = 6, int GS = 0, int XS = 0, int PF = 0, bool ROLL = false> int dm_glue_blocks() {
     static int b[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
     if (b[dev] == 0) {
         int sms = 0, per = 0;
         if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu_kernel<TG, TU>, 256, 0) != cudaSuccess) {
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu_kernel<TG, TU, MB, NCX, GS, XS, PF, ROLL>, 256, 0) != cudaSuccess) {
             cudaGetLastError();
             return 0;
         }
-        b[dev] = std::max(1, (sms - sms / 8) * per);
+        if (std::getenv("DM_GLUE_SAY") != nullptr)
+            std::printf("  [glue] type %d: %d blocks an SM (MB %d, NCX %d, ROLL %d)\n", TG, per, MB, NCX, (int) ROLL);
+        // DM_GLUE_SPARE: the SMs left to the side streams, as a divisor of their count (0: none; default an eighth)
+        const char* e = std::getenv("DM_GLUE_SPARE");
+        const int div = e != nullptr ? std::atoi(e) : 8;
+        b[dev] = std::max(1, (sms - (div > 0 ? sms / div : 0)) * per);
     }
     return b[dev];
 }

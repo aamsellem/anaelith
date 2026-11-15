@@ -316,7 +316,8 @@ __device__ __forceinline__ const uint32_t* table_grid() {
 
 // rows r0, r0 + 1 (gate or up rows r of `dst`; row A at rowA, row B row_bytes after it) for the n <= NC entries
 // from e: entry e + c's activation is xq + ent_tok[e + c] * KC (KC calls a row, one q8_1 block each: 80 or 160)
-template<int TY, int NC, int KC>
+// ROLL: the passes of a row stay a loop instead of being unrolled, so one pass's loads and words are live at a time
+template<int TY, int NC, int KC, bool ROLL = false>
 __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r, int e, int n,
                                       const int32_t* __restrict__ ent_tok, const block_q8_1* __restrict__ xq,
                                       float* __restrict__ dst, int n_ff, const uint32_t* grid, int lane) {
@@ -329,8 +330,7 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
 #pragma unroll
     for (int c = 0; c < NC; ++c) sA[c] = sB[c] = 0.0f;
     static_assert(KC == 80 || KC == 160, "a row is 2560 or 5120 values");
-#pragma unroll
-    for (int it = 0; it < KC / 32; ++it) {
+    auto pass = [&](int it) {
         const int k = lane + 32 * it;
         const typename F::W wa = F::load(rowA, k, grid);
         const typename F::W wb = F::load(rowB, k, grid);
@@ -344,6 +344,13 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
                 sB[c] = __fmaf_rn(d, f, sB[c]);
             }
         }
+    };
+    if constexpr (ROLL) {
+#pragma unroll 1
+        for (int it = 0; it < KC / 32; ++it) pass(it);
+    } else {
+#pragma unroll
+        for (int it = 0; it < KC / 32; ++it) pass(it);
     }
     if constexpr (KC % 32 != 0) {
         const int k2 = KC - 16 + (lane & 15);
@@ -372,8 +379,9 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
     }
 }
 
-// gate/up rows row, row + 1 (0 .. 2 n_ff: both gate or both up rows) of the expert at `blob`, entries [e0, e1)
-template<int TY, int KC = 80>
+// gate/up rows row, row + 1 (0 .. 2 n_ff: both gate or both up rows) of the expert at `blob`, entries [e0, e1).
+// NCX: the most entries a pass takes; fewer keep fewer sums and activation rows live, so the block needs fewer registers
+template<int TY, int KC = 80, int NCX = 6, bool ROLL = false>
 __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                      const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                      float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
@@ -382,39 +390,35 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
     const int n_ff = (int) L.n_ff, rb = (int) (is_up ? L.up_row : L.gu_row);
     const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * rb;
     float* dst = is_up ? up : gate;
+    // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers
+    constexpr int kNC = KC == 160 && NCX > 3 ? 3 : NCX;
     for (int e = e0; e < e1;) {
-        const int n = e1 - e;
+        const int n = min(e1 - e, kNC);
         if (n == 1) {
-            rows2<TY, 1, KC>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
-            e += 1;
+            rows2<TY, 1, KC, ROLL>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
         } else if (n == 2) {
-            rows2<TY, 2, KC>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
-            e += 2;
+            rows2<TY, 2, KC, ROLL>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
         } else if (n == 3) {
-            rows2<TY, 3, KC>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
-            e += 3;
+            rows2<TY, 3, KC, ROLL>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
         } else {
-            // 5120-value rows three entries at a time: the decode then fits kGu2MinBlocks' registers
-            constexpr int kNC = KC == 160 ? 3 : 6;
-            const int m = min(n, kNC);
-            rows2<TY, kNC, KC>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
-            e += m;
+            rows2<TY, kNC, KC, ROLL>(wr, rb, r, e, n, ent_tok, xq, dst, n_ff, grid, lane);
         }
+        e += n;
     }
 }
 
 // pair() for a layer with gate rows of TG and up rows of TU: the up rows read TU's grid from the device table
-template<int TG, int TU, int KC = 80>
+template<int TG, int TU, int KC = 80, int NCX = 6, bool ROLL = false>
 __device__ __forceinline__ void pair_gu(const uint8_t* blob, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                         const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                         float* __restrict__ gate, float* __restrict__ up, const uint32_t* grid, int lane) {
     if constexpr (TG != TU) {
         if (row >= L.n_ff) {
-            pair<TU, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
+            pair<TU, KC, NCX, ROLL>(blob, row, e0, e1, ent_tok, xq, L, gate, up, table_grid<TU>(), lane);
             return;
         }
     }
-    pair<TG, KC>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
+    pair<TG, KC, NCX, ROLL>(blob, row, e0, e1, ent_tok, xq, L, gate, up, grid, lane);
 }
 
 }  // namespace gu2

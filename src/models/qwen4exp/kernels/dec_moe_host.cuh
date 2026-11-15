@@ -51,6 +51,17 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
            native_expert_phase() == 0;
 }
 
+// The gate/up kernel's build, DM_GLUE_BUILD: 0 two blocks an SM and up to six entries a pass, 1 three blocks and
+// three entries, 2 three and two, 3 four and two, 4 four and one, 5 two and three; 6 and 7: builds 0 and 1 with the
+// grid read from the device table.  The same bits.
+static int dm_glue_build() {
+    static const int v = [] {
+        const char* e = std::getenv("DM_GLUE_BUILD");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     const DmGlueArgs& a = a_in;
     if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap || a.n_tok > kDmGlueTokens || a.n_expert > kDmGlueExperts ||
@@ -85,11 +96,22 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
         case 14: go(dm_glue_gu1_kernel<14>, dm_glue1_blocks<14>()); break;
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
         case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
-        case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
+#define DM_GLUE_BUILDS(T) \
+        case T: \
+            switch (dm_glue_build()) { \
+                case 20: go(dm_glue_gu_kernel<T, T, 2, 6, 0, 0, 0, true>, dm_glue_blocks<T, T, 2, 6, 0, 0, 0, true>()); break; \
+                case 21: go(dm_glue_gu_kernel<T, T, 3, 3, 0, 0, 0, true>, dm_glue_blocks<T, T, 3, 3, 0, 0, 0, true>()); break; \
+                case 22: go(dm_glue_gu_kernel<T, T, 4, 2, 0, 0, 0, true>, dm_glue_blocks<T, T, 4, 2, 0, 0, 0, true>()); break; \
+                case 23: go(dm_glue_gu_kernel<T, T, 1, 2, 0, 0, 0, true>, dm_glue_blocks<T, T, 1, 2, 0, 0, 0, true>()); break; \
+                default: go(dm_glue_gu_kernel<T>, dm_glue_blocks<T>()); break; \
+            } \
+            break;
+        DM_GLUE_BUILDS(18)
         case 21: go(dm_glue_gu_kernel<21>, dm_glue_blocks<21>()); break;
-        case 22: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
-        case 23: go(dm_glue_gu_kernel<23>, dm_glue_blocks<23>()); break;
-        case 42: go(dm_glue_gu_kernel<42>, dm_glue_blocks<42>()); break;
+        DM_GLUE_BUILDS(22)
+        DM_GLUE_BUILDS(23)
+        DM_GLUE_BUILDS(42)
+#undef DM_GLUE_BUILDS
         default: basalt::log::error("basalt", "dec_moe_glue: gate/up %d", L.gu_type); std::exit(1);
     }
     check("dec_moe_glue/gu");
