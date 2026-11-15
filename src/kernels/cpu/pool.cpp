@@ -11,6 +11,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/waitpkg.hpp"
+
+namespace {
+// A parked worker's wait under WAITPKG (--exp umwait): between two batches (a layer's GPU work, a few hundred
+// microseconds) every worker waits, and UMWAIT on `epoch_`'s line, which the host writes to publish a batch, keeps
+// its core in a light sleep instead of pausing at full clock (see waitpkg.hpp).
+constexpr unsigned long long kUmwaitTsc = 60000;   // about 20 us of TSC; the OS caps one wait as well
+}  // namespace
 
 namespace basalt::kernels::cpu {
 
@@ -92,6 +101,16 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     basalt::core::diag_pool_fn().store(&diag_active_pool);
     split_multi_.resize((size_t) kMaxSplitMulti);
     fused_.reset(new FusedExpert[(size_t) kMaxSplitMulti]);
+    // --exp umwait=2 (C0.2) or 1 (C0.1): how a parked worker waits, where the processor has WAITPKG
+    const int want_umwait = (int) basalt::core::exp_flag("umwait", 0);
+    if (want_umwait != 0) {
+        if (basalt::core::waitpkg_supported()) {
+            umwait_ = want_umwait == 1 ? 1 : 2;
+            basalt::log::info("basalt pool", "parked workers wait in C0.%d (UMWAIT) for the next batch", umwait_);
+        } else {
+            basalt::log::warn("basalt pool", "--exp umwait: this processor has no WAITPKG; parked workers pause");
+        }
+    }
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         threads_.emplace_back([this, i] { worker(i); });
@@ -143,8 +162,12 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 63u) != 0) continue;
+            if (umwait_ != 0) {   // one wait lasts up to kUmwaitTsc: the clock is read after each
+                basalt::core::umwait_while(epoch_, seen, umwait_ == 1, kUmwaitTsc);
+            } else {
+                _mm_pause();
+                if ((++spins & 63u) != 0) continue;
+            }
             const auto now = std::chrono::steady_clock::now();
             if (now - parked_at < spin_before_sleep_) {
                 if (now >= yield_at) {
