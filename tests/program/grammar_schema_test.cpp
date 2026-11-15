@@ -139,9 +139,12 @@ static void test_tools() {
     CHECK(call_ok(g, head + "<parameter=city>\nab</parameter> cd\n</parameter>\n" + metric + "</function>\n</tool_call>"));
     CHECK(call_ok(g, head + "<parameter=city>\n<parameter=limit>40</parameter>\n</parameter>\n" + metric + "</function>\n</tool_call>"));
     CHECK(call_ok(g, head + "<parameter=city>\n</parameter>\n</parameter>\n</parameter>\n" + metric + "</function>\n</tool_call>"));
-    // a tag the structure follows ends the value, wherever it stands: the value cannot swallow the rest of the call
-    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n<parameter="));
-    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n</function>"));
+    // a tag the structure follows ends the value, wherever it stands: also straight after the text, without the
+    // line break of the usual close; the value cannot swallow the rest of the call
+    CHECK(pre(g, head + "<parameter=city>\nab</parameter>\n<parameter="));
+    CHECK(call_ok(g, head + "<parameter=city>\nab</parameter>\n" + metric + "</function>\n</tool_call>"));
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n<parameter=city>"));   // not the same parameter again
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n</function>"));        // `metric` is still to write
     CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n</tool_call>"));
     CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n<tool_call>"));
     // a call that skips the function's end is refused instead of read as text
@@ -402,17 +405,33 @@ static void test_text_holds_end() {
     // a line of tool markup as the value: what an edit of a chat template or a parser writes
     CHECK(call_ok(g, open + "<parameter=limit>40</parameter>" + close));
     CHECK(call_ok(g, open + "if tag == \"</parameter>\":\n    depth -= 1" + close));
-    // the structure after a tag ends the value whatever white space stands between them
+    // the structure after a tag the value does not quote is never the value's, whatever white space stands between
+    // them; after the close's own line break it is the call's, and the tag closed the value
     for (const char* gap : {"", " ", "\n", "\n\n", " \r\n\t"}) {
-        CHECK(!pre(g, open + "a</parameter>" + gap + "<parameter="));
-        CHECK(!pre(g, open + "a</parameter>" + gap + "</function>"));
+        CHECK(!pre(g, open + "a</parameter>" + gap + "<parameter="));   // no parameter is left to write
+        CHECK(pre(g, open + "a</parameter>" + gap + "</function>") == (std::string(gap) == "\n"));
         CHECK(!pre(g, open + "a</parameter>" + gap + "</tool_call>"));
         CHECK(pre(g, open + "a</parameter>" + gap + "<b>"));   // any other text after the tag stays in the value
     }
-    // a model that takes a quoted tag for its value's own is held to the real one before the next parameter
+    // a model that quotes a parameter often takes the quoted tag for its value's own and writes the structure
+    // straight after it: the call goes on (the parser keeps the quoted tag in the value), with or without the real tag
     const std::string first = "<tool_call>\n<function=write>\n<parameter=path>\n<parameter=limit>40</parameter>\n";
-    CHECK(!pre(g, first + "<parameter=content>"));
+    CHECK(pre(g, first + "<parameter=content>\n"));
     CHECK(pre(g, first + "</parameter>\n<parameter=content>\n"));
+    CHECK(call_ok(g, open + "<parameter=limit>25</parameter>\n</function>\n</tool_call>"));
+    CHECK(call_ok(g, open + "<parameter=limit>25</parameter>" + close));
+    // after a quoted parameter's tag the text may go on with anything: the rest of the call a file shows after it
+    // (the function's end while `content` is still to write), another quoted parameter
+    CHECK(call_ok(g, first + "</function>\n</parameter>\n<parameter=content>\nx" + close));
+    CHECK(call_ok(g, open + "<parameter=path>README.md</parameter>\n<parameter=limit>40</parameter>" + close));
+    CHECK(call_ok(g, open + "<parameter=path>README.md</parameter>\n<parameter=limit>40</parameter>\n</function>\n</tool_call>"));
+    // ... but not with the call's end: the parser ends the call at the function's end the call's end follows, so
+    // where the function cannot end yet (`content` is to write) that is refused
+    CHECK(!pre(g, first + "</function>\n</tool_call>"));
+    CHECK(pre(g, first + "</function>\n"));
+    // an opening the value only mentions changes nothing for the usual close
+    CHECK(call_ok(g, open + "use <parameter=x> to pass x" + close));
+    CHECK(call_ok(g, open + "use <parameter=> or <parameter=a b> as text" + close));
     // and a call cannot end inside a value: the function's end must be written
     CHECK(!pre(g, open + "text\n</parameter>\n</tool_call>"));
 
