@@ -168,7 +168,7 @@ struct TextEnd {
 // parameter or the function's end.  The call's end and a new call are excluded there as well, though the parser would
 // read them as text: a call that skips the function's end is then refused instead of swallowed by the value.
 // After the tag of a parameter the value quotes, the text may go on with anything (add_free_text) but the function's
-// end with the call's end behind it: the parser ends the call there.
+// end with the call's end or a new call behind it: that is a call ending, not a quoted line.
 std::vector<TextEnd> free_text_ends(const ToolForm& form) {
     std::vector<TextEnd> ends;
     const std::vector<std::string> tag = utf8_chars(form.text_end);
@@ -182,13 +182,14 @@ std::vector<TextEnd> free_text_ends(const ToolForm& form) {
             for (const std::string& ch : utf8_chars(next)) e.chars.push_back(ch);
             ends.push_back(e);
         }
-        if (!form.fn_close.empty() && !trimmed(form.call_close).empty()) {
+        for (const std::string& next : {trimmed(form.call_close), trimmed(form.call_open)}) {
+            if (form.fn_close.empty() || next.empty()) continue;
             TextEnd e;
             e.chars = tag;
             e.gap = (int) tag.size();
             for (const std::string& ch : utf8_chars(form.fn_close)) e.chars.push_back(ch);
             e.gap2 = (int) e.chars.size();
-            for (const std::string& ch : utf8_chars(trimmed(form.call_close))) e.chars.push_back(ch);
+            for (const std::string& ch : utf8_chars(next)) e.chars.push_back(ch);
             e.quoted = true;
             ends.push_back(e);
         }
