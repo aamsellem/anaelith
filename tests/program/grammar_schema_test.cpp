@@ -425,9 +425,10 @@ static void test_text_holds_end() {
     CHECK(call_ok(g, first + "</function>\n</parameter>\n<parameter=content>\nx" + close));
     CHECK(call_ok(g, open + "<parameter=path>README.md</parameter>\n<parameter=limit>40</parameter>" + close));
     CHECK(call_ok(g, open + "<parameter=path>README.md</parameter>\n<parameter=limit>40</parameter>\n</function>\n</tool_call>"));
-    // ... but not with the call's end: the parser ends the call at the function's end the call's end follows, so
-    // where the function cannot end yet (`content` is to write) that is refused
+    // ... but not with the call's end or a new call: the parser ends the call at the function's end that one of
+    // them follows, so where the function cannot end yet (`content` is to write) that is refused
     CHECK(!pre(g, first + "</function>\n</tool_call>"));
+    CHECK(!pre(g, first + "</function>\n<tool_call>"));
     CHECK(pre(g, first + "</function>\n"));
     // an opening the value only mentions changes nothing for the usual close
     CHECK(call_ok(g, open + "use <parameter=x> to pass x" + close));
