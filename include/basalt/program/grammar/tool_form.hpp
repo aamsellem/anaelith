@@ -10,6 +10,9 @@ struct ToolForm {
     std::string fn_open, fn_mid, fn_close;            ///< fn_open NAME fn_mid PARAMETERS fn_close
     std::string param_open, param_mid_text, param_mid_value, param_close;   ///< param_open NAME param_mid_* VALUE param_close
     std::string text_end;                             ///< what ends a parameter's free text
+    /// A value may hold text_end: the tag ends it only where the call's structure follows.  For a model whose
+    /// server-side parser reads values that way; off, the first text_end ends the value.
+    bool text_holds_end = false;
     bool calls_share_block = false;                   ///< several calls in one call_open .. call_close, joined by a newline
     std::string trigger;                              ///< the text that starts a call: the lazy trigger
 };
