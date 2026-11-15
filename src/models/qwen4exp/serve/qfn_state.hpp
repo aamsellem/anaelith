@@ -278,6 +278,8 @@ private:
     struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
     bool peer_excl{};
     bool xq_across{};
+    std::vector<int32_t> xq_class{};   // each layer's blob-size class: the rounds that rank across layers do so per class
+    int32_t xq_classes{1};
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};

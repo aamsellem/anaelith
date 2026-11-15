@@ -149,30 +149,38 @@ void QfnRuntime::rank_swaps(std::vector<Swap>& swaps, bool across) {
         // residents to choose from, a missing expert is a candidate at a lower count.  An expert the peer tier
         // holds ranks lower by the promotion margin, as in the per-layer rounds, and the resident it replaces
         // takes its peer slot.
+        //
+        // A slot takes any expert of its own blob size, so the ranking is made over the layers of each size: one
+        // ranking where every layer's blobs are one size, one per size on a pack whose layers differ.
         struct Ent { float u; int32_t rank, layer, e; };
         std::vector<Ent> cand, vict;
-        for (int64_t l = 0; l < g.n_layers; ++l) {
-            const float* u = drive.d.usage.data() + l * g.n_expert;
-            const int32_t* r = host_res.data() + l * g.n_expert;
-            for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
-                if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
-                else if (u[e] >= 1.5f)
-                    cand.push_back({peer.valid() && peer.has(l, e) ? u[e] - promote_margin : u[e], rk, (int32_t) l, e});
-            }
-        }
-        if (cand.empty() || vict.empty()) return;
         auto key = [](const Ent& x) { return std::make_tuple(x.rank, x.layer, x.e); };
-        std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
-            return a.u != b.u ? a.u > b.u : key(a) < key(b);
-        });
-        const size_t nc = std::min(cand.size(), vict.size());
-        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
-            return a.u != b.u ? a.u < b.u : key(a) > key(b);
-        });
-        for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].u < vict[i].u + 1.5f) break;
-            swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+        for (int32_t c = 0; c < xq_classes; ++c) {
+            cand.clear();
+            vict.clear();
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                if (xq_class[(size_t) l] != c) continue;
+                const float* u = drive.d.usage.data() + l * g.n_expert;
+                const int32_t* r = host_res.data() + l * g.n_expert;
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                    const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
+                    if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
+                    else if (u[e] >= 1.5f)
+                        cand.push_back({peer.valid() && peer.has(l, e) ? u[e] - promote_margin : u[e], rk, (int32_t) l, e});
+                }
+            }
+            if (cand.empty() || vict.empty()) continue;
+            std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
+                return a.u != b.u ? a.u > b.u : key(a) < key(b);
+            });
+            const size_t nc = std::min(cand.size(), vict.size());
+            std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
+                return a.u != b.u ? a.u < b.u : key(a) > key(b);
+            });
+            for (size_t i = 0; i < nc; ++i) {
+                if (cand[i].u < vict[i].u + 1.5f) break;
+                swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+            }
         }
         std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
         return;
@@ -214,37 +222,49 @@ void QfnRuntime::rank_swaps(std::vector<Swap>& swaps, bool across) {
 }
 
 // Up to `room` more swaps over every layer: CPU-tier experts routed about once lately (a count from once_bar up to the
-// main ranking's floor), each against a resident expert at least once_bar below it that no swap of the round takes
+// main ranking's floor), each against a resident expert at least once_bar below it that no swap of the round takes.
+// Ranked over the layers of each blob size, as the main ranking; with several sizes the best of all take the room.
 void QfnRuntime::rank_once(std::vector<Swap>& swaps, size_t room) {
     struct Ent { float u; int32_t rank, layer, e; };
     std::vector<Ent> cand, vict;
+    std::vector<Swap> more;
     std::vector<uint8_t> taken(host_res.size(), 0);
     for (const Swap& s : swaps) taken[(size_t) s.lout * g.n_expert + s.out] = 1;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
-        const float* u = drive.d.usage.data() + l * g.n_expert;
-        const int32_t* r = host_res.data() + l * g.n_expert;
-        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-            const size_t i = (size_t) (l * g.n_expert + e);
-            if (r[e] >= 0) {
-                if (!taken[i] && u[e] < 1.5f - once_bar) vict.push_back({u[e], prof_rank[i], (int32_t) l, e});
-            } else if (u[e] >= once_bar && u[e] < 1.5f && !(peer.valid() && peer.has(l, e))) {
-                cand.push_back({u[e], prof_rank[i], (int32_t) l, e});
+    auto key = [](const Ent& x) { return std::make_tuple(x.rank, x.layer, x.e); };
+    for (int32_t c = 0; c < xq_classes; ++c) {
+        cand.clear();
+        vict.clear();
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (xq_class[(size_t) l] != c) continue;
+            const float* u = drive.d.usage.data() + l * g.n_expert;
+            const int32_t* r = host_res.data() + l * g.n_expert;
+            for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                const size_t i = (size_t) (l * g.n_expert + e);
+                if (r[e] >= 0) {
+                    if (!taken[i] && u[e] < 1.5f - once_bar) vict.push_back({u[e], prof_rank[i], (int32_t) l, e});
+                } else if (u[e] >= once_bar && u[e] < 1.5f && !(peer.valid() && peer.has(l, e))) {
+                    cand.push_back({u[e], prof_rank[i], (int32_t) l, e});
+                }
             }
         }
+        const size_t nc = std::min(room, std::min(cand.size(), vict.size()));
+        if (nc == 0) continue;
+        std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
+            return a.u != b.u ? a.u > b.u : key(a) < key(b);
+        });
+        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
+            return a.u != b.u ? a.u < b.u : key(a) > key(b);
+        });
+        for (size_t i = 0; i < nc; ++i) {
+            if (cand[i].u < vict[i].u + once_bar) break;
+            more.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+        }
     }
-    const size_t nc = std::min(room, std::min(cand.size(), vict.size()));
-    if (nc == 0) return;
-    auto key = [](const Ent& x) { return std::make_tuple(x.rank, x.layer, x.e); };
-    std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
-        return a.u != b.u ? a.u > b.u : key(a) < key(b);
-    });
-    std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
-        return a.u != b.u ? a.u < b.u : key(a) > key(b);
-    });
-    for (size_t i = 0; i < nc; ++i) {
-        if (cand[i].u < vict[i].u + once_bar) break;
-        swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+    if (more.size() > room) {
+        std::stable_sort(more.begin(), more.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+        more.resize(room);
     }
+    swaps.insert(swaps.end(), more.begin(), more.end());
 }
 
 bool QfnRuntime::adapt() {
@@ -598,10 +618,26 @@ int QfnRuntime::init_tiers() {
 
     peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
     // the rounds rank over all layers when at most one peer tier holds experts (not exclusively) and every layer's
-    // blobs are one size (a slot then takes any layer's expert)
-    xq_across = xpeers.empty() && !peer_excl;
-    for (int64_t l = 1; xq_across && l < g.n_layers; ++l)
-        xq_across = basalt::kernels::cpu::expert_layout().blob_bytes(l) == basalt::kernels::cpu::expert_layout().blob_bytes(0);
+    // blobs are one size (a slot then takes any layer's expert).  A pack whose layers differ in size (an Unsloth
+    // Dynamic pack: a few sizes) can rank over the layers of each size, since a slot takes any expert of its own
+    // size: --exp tier_across=1.  Without it such a pack keeps every layer on its own slots.
+    {
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        std::vector<uint64_t> sizes;
+        xq_class.assign((size_t) g.n_layers, 0);
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const uint64_t b = (uint64_t) lay.blob_bytes(l);
+            size_t c = 0;
+            while (c < sizes.size() && sizes[c] != b) ++c;
+            if (c == sizes.size()) sizes.push_back(b);
+            xq_class[(size_t) l] = (int32_t) c;
+        }
+        xq_classes = (int32_t) sizes.size();
+        xq_across = xpeers.empty() && !peer_excl && (xq_classes == 1 || basalt::core::exp_flag("tier_across", 0) != 0);
+        if (xq_across && xq_classes > 1)
+            basalt::log::info("basalt serve", "adaptive tier: the rounds rank over the layers of each blob size (%d sizes)",
+                              (int) xq_classes);
+    }
 
     xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
