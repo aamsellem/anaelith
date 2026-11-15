@@ -1,93 +1,187 @@
-<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
+# anaelith
 
-Basalt is a local inference engine for mixture-of-experts models, **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**, and the dense
-**Qwen3.8-27B**. It runs on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in
-system RAM (and optionally on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
+anaelith is a fork of [Basalt](https://github.com/jesdga95/basalt), a local inference engine for mixture-of-experts
+models on NVIDIA Blackwell GPUs. The fork is worked on and measured on one machine, an Olares One: a mini PC with an
+RTX 5090 Laptop GPU (24 GB), a Core Ultra 9 275HX (8 performance cores and 16 efficient cores, no SMT) and 96 GB of
+DDR5. Its changes are for machines of that kind: one 24 GB card, a hybrid Intel processor, and a processor and a GPU
+that share a cooler and a power budget.
 
-<p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
+Everything else is Basalt as upstream wrote it: the models, the `.basalt` packs, the server with its OpenAI and
+Anthropic APIs, the flags, and the documentation under [docs](docs). The binaries keep the name `basalt`. The fork
+publishes no release archives and no packs; upstream's are at
+[its releases](https://github.com/jesdga95/basalt/releases) and on
+[Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt).
 
-**Help wanted:** spare Blackwell compute for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
+## Branches
 
-## Requirements
+- `one`: the fork. It starts from upstream 0.4.0.
+- `main`: upstream's `main` as it was when the fork was made, unchanged.
+- `tier-across-sizes`: a measured change that did not win and is not in `one` (see [below](#tried-and-not-kept)).
 
-- Linux x86-64 with AVX2, or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
-- CMake 3.24+, GCC 13+ (Linux), Python 3.10+, and enough system RAM for the experts that do not fit in VRAM.
+## What differs from upstream
 
-## Quick start
+All figures on this page were measured on the One with Qwen3.8-Flash-Next, pack `Qwen3.8-FN-UD-IQ3_XXS`, the GPU's
+power limit at 175 W. During decode the GPU sits at its thermal limit (86 C, fans at their maximum) and draws 130 to
+150 W.
 
-Prebuilt Linux and Windows archives are attached to each [release](https://github.com/jesdga95/basalt/releases) ([what they need](docs/platforms.md#release-archives)); otherwise build from source:
+### Hybrid Intel processors are recognized on Linux
+
+Upstream reads a core's class from `/sys/devices/system/cpu/cpuN/cpu_capacity`. x86 kernels do not publish that file
+(it comes from the arch_topology driver, which x86 does not build), so a hybrid Intel processor counted as one class
+and the pool started with every core but one: 23 workers on a 275HX. The fork falls back to the CPU lists of the
+kernel's two hybrid PMUs, `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus` (Linux 5.13 and later), and
+the documented rule then gives the performance cores minus one plus half the efficient cores: 15 here, with no
+`--pool-workers`.
+
+Measured with upstream 0.3.3 (800 tokens a prompt): 23 workers 149.3 tok/s greedy and 136.0 sampled, 15 workers
+164.3 and 167.8. `tests/platform/cpu_test.cpp` checks the topology against the kernel's lists where they exist.
+
+### A tool call that quotes tool-call markup is read as it is written
+
+A model that edits a chat template or a parser writes a line of tool-call markup as an argument, for instance
+`<parameter=limit>25</parameter>` as the new text of an edit. It then often takes the quoted closing tag for its
+value's own and writes the next parameter or the function's end straight after it. Upstream's parser ended the value
+before that tag (`<parameter=limit>25`), and its grammar refused the function's end at its last character, where the
+model could only add a stray one (`</function≥`).
+
+- The parser (`serve/frontend.py`, `param_close`) follows the parameters a value quotes. The tag that closes a
+  quoted one belongs to the value; where the call's structure follows it directly and the tag does not start a line,
+  the value ends with it. After a quoted parameter, a parameter the function does not declare or already has, and a
+  function end that the call's end does not follow, stay in the value. Nothing is added to the model's text or
+  changed in it: the rule only decides which closing tag ends the value.
+- The grammar (`src/program/grammar/schema.cpp`) lets a text value hold its closing tag and close at the tag with or
+  without the line break before it. It follows the quoted parameters and lets the text go on after their tag,
+  except with a function end that the call's end or a new call follows.
+
+Measured with 40 two-turn sequences that ask for an edit of a template line and a test run, checked on whether the
+edit gives the right file and both calls are made:
+
+| | sequences right, of 40 |
+|---|---:|
+| upstream parser, no grammar | 15 |
+| fork's parser, no grammar | 27 |
+| fork's parser and grammar | 30 |
+
+What is left is the model's own: it makes one call of the two (9 to 12 sequences), or writes the tags as HTML
+entities. The grammar's last rule, the new call after a function end, was added after these runs. Tests:
+`serve/tests/test_quoted_parameter_values.py`, `tests/program/grammar_schema_test.cpp`.
+
+### The CPU tier's warm-up runs on packs whose layers differ in format
+
+Between two doorbells the idle pool scores the next layer's router and reads the likeliest CPU-held expert into its
+caches. Upstream turns this off unless every layer's blobs have the same size, which leaves out every Unsloth Dynamic
+pack (UD-IQ3_XXS mixes IQ2_S, IQ3_XXS and IQ4_XS gate and up rows with IQ4_NL and Q2_0 down rows). The fork keeps a
+size and a down-row offset per layer. `--exp warm_n=N` sets how many predicted experts are read, likeliest first
+(default 1, at most 4, 0 turns the warm-up off), and `--decode-timing` prints how the predictions turned out.
+
+Measured: the prediction is right for 43 to 51% of its picks on `conv`, 32 to 40% on `prose` and 15% on `struct`.
+End to end that is +2% on `conv` at best, inside the run-to-run noise. It repairs a feature that was off by accident;
+it is not a speed-up on this machine.
+
+### Waiting threads can sleep lightly (`--exp umwait`, `--exp host_tpause`)
+
+The pool's workers wait for the GPU about two thirds of the time during decode, pausing at full clock. With
+`--exp umwait=2` a parked worker arms UMONITOR on the word the host writes to publish a batch and waits in C0.2 with
+UMWAIT (`umwait=1`: C0.1). With `--exp host_tpause=1` the host thread pauses in C0.2 for about a microsecond between
+two polls of the GPU's ring (TPAUSE). Both need WAITPKG and do nothing without it. Off by default.
+
+| | CPU package | GPU | SM clock | struct tok/s |
+|---|---:|---:|---:|---:|
+| pause (upstream) | 61.6 W | 137.3 W | 1930 MHz | 285.5 |
+| workers in C0.2 | 52.3 W | 142.4 W | 1981 MHz | 289.0 |
+| workers in C0.2, host TPAUSE | 50.6 W | 142.8 W | 1988 MHz | 289.0 |
+
+The processor draws 11 W less and the GPU takes about half of it back at the same temperature. `struct` gains nothing
+on a cold first repetition and 2 to 2.7% on the next two.
+
+## Build and run
+
+The requirements and the build are upstream's ([building](docs/building.md), [platforms](docs/platforms.md)): Linux
+x86-64 with AVX2 or Windows x64, a Blackwell GPU with CUDA 13, CMake 3.24+, GCC 13+, Python 3.10+.
 
 ```sh
-git clone https://github.com/jesdga95/basalt && cd basalt
+git clone -b one https://github.com/aamsellem/anaelith && cd anaelith
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
-                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41 or qwen35 ([building](docs/building.md#building-only-some-models))
+                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41 or qwen35
 pip install -r requirements.txt
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-UD-IQ3_XXS.basalt --local-dir models
 ```
 
-Put the settings in `basalt_config.json`:
-
-```json
-{
-  "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
-  "engine": { "resident-experts": true },
-  "server": { "port": 8080 }
-}
-```
+On a 24 GB card with 96 GB of RAM:
 
 ```sh
-bin/basalt serve --config basalt_config.json
+bin/basalt serve models/Qwen3.8-FN-UD-IQ3_XXS.basalt --port 8080 --max-context 65536 --kv int8 \
+    --resident-budget-gib 48 --ram-reserve-mib 12288
 ```
 
-The server listens on 127.0.0.1. Every setting: [configuration](docs/configuration/index.md). More examples:
-[example configurations](docs/configuration/examples.md).
+The server listens on 127.0.0.1. Every setting: [configuration](docs/configuration/index.md). The models and their
+guides: [models](docs/models/index.md).
 
-## Models
+## How things were measured
 
-| | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | Qwen3.8-27B |
-|---|---|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) | default `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt) | `Qwen3.8-27B-QUASAR-NVFP4`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-27B-Basalt) |
-| Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it, up to 1,048,576 | default 8,192; up to 262,144 |
-| Drafting | MTP, on by default | DSpark, on by default | DFlash 2 (or MTP), on by default |
-| Images | yes | yes | yes |
-| Documents (PDF, text) | yes | yes | yes |
-| Video | yes, with FFmpeg ([video](docs/running.md#video)) | no | yes, with FFmpeg |
-| Guide | [guide](docs/models/qwen38-flash-next.md) | [guide](docs/models/deepseek41.md) | [guide](docs/models/qwen38-27b.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) | [precision](docs/precision/deepseek41.md) | [precision](docs/precision/qwen38-27b.md) |
+`bin/basalt-bench --model PACK -t conv,struct,prose -r N -o json --logs DIR -- FLAGS --decode-timing`, with
+`--resident-budget-gib 48 --ram-reserve-mib 12288 --pool-workers 15`. `conv` and `prose` are sampled and differ from
+run to run. `struct` is greedy and gives the same 7,230 tokens every time, so it is the fixture a small difference
+can be read on.
 
-All models compared: [models](docs/models/index.md).
+The GPU loses 15% of its clock between a cold and a hot repetition. Two settings are therefore compared in one
+session in a balanced order (A B B A), each arm starts once the GPU is back near 55 C or after a fixed wait, and a
+setting is judged on both of its arms. The processor's package power comes from RAPL and the GPU's power and clock
+from NVML, read every second while the GPU is busy.
 
-## Documentation
+Upstream 0.4.0 on this machine, two sessions:
 
-- **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
-  [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
-  [documents](docs/configuration/documents.md),
-  [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
-- **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md), [DeepSeek](docs/models/deepseek41.md),
-  [Qwen3.8-27B](docs/models/qwen38-27b.md),
-  [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
-- **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
-- **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),
-  [changelog](docs/changelog/index.md), [contributing](CONTRIBUTING.md).
+| | tok/s |
+|---|---:|
+| `conv` | 178.4, 179.3 |
+| `struct` | 301.4, 301.6 |
+| `prose` | 151.6, 153.6 |
+| prompt read, 16K tokens | 2,780, 2,743 |
+| prompt read, 32K tokens | 2,774, 2,748 |
+
+## What sets the speed on this machine
+
+- **The window.** A verify window of T token rows takes about 9.3 + 1.9 T ms: 16 ms at T 3.6 on `conv`, 24 ms at
+  T 7.7 on `struct`, for 2.8 and 7.4 tokens. The first term is the pass over the dense weights, shared by the rows;
+  each row then reads its own experts.
+- **The GPU's clock.** At its thermal limit the GPU runs its SM clock between 1.7 and 2.6 GHz, 2.0 GHz on average,
+  of 3.09. Speed follows the clock, which is why a watt less in the processor shows.
+- **Not the CPU tier.** Three changes cut the CPU's expert work and left the speed where it was: the tier ranked
+  across layers (18% fewer experts on the CPU in `conv`), every expert of layer 0 resident (that layer's wait on the
+  CPU gone), and huge pages under the experts in RAM. Fewer workers do cost speed, so the tier is sized about right.
+- **The drafts.** On sampled text 78% of the MTP's drafts are kept. Drawing the drafts and keeping them with the
+  min(1, p/q) rule would keep 79 to 79.5%: the head is confident where the model is not.
+
+## Tried and not kept
+
+- **The VRAM tier ranked across layers** on a pack whose layers differ in blob size (upstream does it where they do
+  not). Branch `tier-across-sizes`, `--exp tier_across=1`. Experts on the CPU per layer and window: `conv` 3.30 to
+  2.70, `prose` 2.05 to 1.65, `struct` 4.64 to 4.21; package power 52.4 to 50.2 W; speed unchanged (`conv` 168.0 to
+  167.4 tok/s, `struct` 297.2 to 298.3).
+- **Every expert of layer 0 resident.** In `conv` and `prose` the first three layers route the most varied experts
+  and the device waits longest for the CPU there (0.43 ms a window for layer 0). With layer 0 whole in VRAM that
+  wait is zero and the speed the same: 166.2 to 166.7 tok/s on `conv`, 158.1 to 158.4 on `prose`, six runs each.
+- **Huge pages under the experts in RAM.** The arena is aligned for them but not requested, so with transparent
+  huge pages in `madvise` mode it sits on 4 KiB pages. Requested, all 33 GiB are on 2 MiB pages; the CPU's time per
+  expert stays within 1% and the start is a second faster.
+- **The pool on the efficient cores only.** Same speed, 3.7 W more package power.
+- **Fewer pool workers.** 5, 7 and 11 lose to 15, although the GPU clocks 5 to 9% higher with 5.
+- **Exact speculative sampling for the MTP drafter**, estimated from `--exp spec_log=1`: 78.1% of drafts kept
+  today, 78.9 to 79.5% with drawn drafts.
+- **Predicting the experts a layer routes next**, to bring them to the GPU in time. A table of which experts follow
+  which, learned as the text goes, finds the experts that were not routed lately no better than their frequency
+  does; a token's experts one layer up find 19% of them among three candidates.
+- **Two requests at once** (`--parallel 2`): 187 to 199 tok/s in all against 175 to 186 one after the other, each of
+  the two at about 100.
 
 ## Credits
 
-- [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
-- [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (and [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) and [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
-  the models. Their packs carry the models' own licences (see the Hugging Face cards).
-- [unsloth](https://huggingface.co/unsloth) (GGUFs), [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts and the
-  [NVFP4 27B](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)), [QUASAR-QAT](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
-  (the 27B pack's quantization-aware NVFP4 checkpoint, Apache-2.0), [z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) (the
-  27B's DFlash 2 drafter), [NInfer](https://github.com/Neroued/ninfer) (the reference for the 27B).
-- [Infernix](https://github.com/Wallawalla47/Infernix) (Ian Ranson and contributors): prompt and decode kernels adapted for the 27B
-  and Flash-Next (Apache-2.0, [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
-- [@giveen](https://huggingface.co/giveen): the BF16 reference for the DeepSeek quality numbers, and prompt kernels for the 27B's NVFP4
-  GDN and attention layers.
-- [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels in `src/` (MIT,
-  [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
+- [Basalt](https://github.com/jesdga95/basalt) (MIT): the engine this repository forks. Its own credits are in
+  [its README](https://github.com/jesdga95/basalt#credits) and in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+- [Strata](https://github.com/Niko1221/Strata) (MIT): the project Basalt forks.
+- [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and the other model authors: the models. Their packs carry
+  the models' own licences.
 
 ## License
 
