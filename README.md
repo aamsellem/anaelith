@@ -146,12 +146,19 @@ Upstream 0.4.0 on this machine, two sessions:
   T 7.7 on `struct`, for 2.8 and 7.4 tokens. The first term is the pass over the dense weights, shared by the rows;
   each row then reads its own experts.
 - **The GPU's clock.** At its thermal limit the GPU runs its SM clock between 1.7 and 2.6 GHz, 2.0 GHz on average,
-  of 3.09. Speed follows the clock, which is why a watt less in the processor shows.
+  of 3.09. Speed follows the clock, which is why a watt less in the processor shows. Heat builds up: three
+  repetitions of `struct` back to back give 306, 292 and 270 tok/s.
+- **The experts on the GPU.** The stage profile (`--profile`) puts the GPU's own experts at 5.5 of 16.8 ms a window
+  on `conv` and 12.7 of 27.1 ms on `struct`, the largest stage in both. At about 5 us for an expert of 1.9 MiB that
+  is 40% of the card's memory bandwidth: these kernels are bound by decoding the quantized weights, at the clock the
+  heat allows.
 - **Not the CPU tier.** Three changes cut the CPU's expert work and left the speed where it was: the tier ranked
   across layers (18% fewer experts on the CPU in `conv`), every expert of layer 0 resident (that layer's wait on the
   CPU gone), and huge pages under the experts in RAM. Fewer workers do cost speed, so the tier is sized about right.
 - **The drafts.** On sampled text 78% of the MTP's drafts are kept. Drawing the drafts and keeping them with the
-  min(1, p/q) rule would keep 79 to 79.5%: the head is confident where the model is not.
+  min(1, p/q) rule would keep 79 to 79.5%: the head is confident where the model is not. Upstream's
+  `--relaxed-drafting`, which changes what is sampled, keeps more: `conv` 167.0 to 173.2 tok/s and `prose` 158.2 to
+  167.0 at 0.5, 183.7 and 167.5 at 0.3 (six runs each).
 
 ## Tried and not kept
 
@@ -165,6 +172,9 @@ Upstream 0.4.0 on this machine, two sessions:
 - **Huge pages under the experts in RAM.** The arena is aligned for them but not requested, so with transparent
   huge pages in `madvise` mode it sits on 4 KiB pages. Requested, all 33 GiB are on 2 MiB pages; the CPU's time per
   expert stays within 1% and the start is a second faster.
+- **A locked GPU clock** (`nvidia-smi -lgc`). On `struct`, six runs each: 291.6 tok/s at 2150 MHz and 283.0 at
+  2000 MHz against 289.7 with the driver's own control. Under sustained heat the clock falls below the lock either
+  way.
 - **The pool on the efficient cores only.** Same speed, 3.7 W more package power.
 - **Fewer pool workers.** 5, 7 and 11 lose to 15, although the GPU clocks 5 to 9% higher with 5.
 - **Exact speculative sampling for the MTP drafter**, estimated from `--exp spec_log=1`: 78.1% of drafts kept
