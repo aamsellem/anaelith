@@ -4,7 +4,9 @@
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/waitpkg.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
@@ -197,9 +199,15 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
 
 // The host's side of the window: each layer's ring, served as the GPU reaches it.
 bool Verifier::run_serve(PoolMultiFn pool, void* user, std::string& err) {
+    // --exp host_tpause=1: between two polls of the GPU's ring the host thread pauses in C0.2 for about a microsecond
+    // (TPAUSE; the ring is written by the device, which no monitor sees) instead of pausing at full clock.
+    static const bool tpause = exp_flag("host_tpause", 0) != 0 && waitpkg_supported();
     for (;;) {
         const int r = serve_poll(pool, user, err);
         if (r != 0) return r > 0;
+#if BASALT_HAVE_WAITPKG
+        if (tpause) { tpause_for(3000); continue; }
+#endif
         _mm_pause();
     }
 }
