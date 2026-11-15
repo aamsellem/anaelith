@@ -594,39 +594,80 @@ FUNC_END = "</function>"
 PARAM_START = "<parameter="
 FUNC_START = "<function="
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
+_PARAM_MARK = re.compile(r"<parameter=[^<>\s]+>|</parameter>")
 
 
-def param_end(text: str, final: bool = False, name: str | None = None) -> int:
-    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
-    -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
+class CallShape:
+    """The parameters a call may still write: the names its function declares (not known without a schema) and the
+    names written so far."""
+
+    def __init__(self, tool: dict | None = None):
+        self.declared = set(_tool_properties(tool)) or None
+        self.given: set[str] = set()
+
+    def follows(self, name: str) -> bool:
+        """A parameter of that name may come next."""
+        return name not in self.given and (self.declared is None or name in self.declared)
+
+
+def param_close(text: str, final: bool = False, name: str | None = None,
+                shape: CallShape | None = None) -> tuple[int, bool]:
+    """Find the closing tag that ends a parameter's value: the first one the call's structure follows (another
+    parameter or the function's end), with quoted calls and a reopened parameter kept inside the value.
+    -> (at, keep). at -1: none yet; -2: a candidate awaiting more output. keep: the tag is the value's own last text.
+
+    A value may quote a parameter (`<parameter=limit>25</parameter>`); the tag that closes the quoted one is the
+    value's. A model then often leaves out the real one and writes the structure straight after it: there the value
+    ends with the quoted tag (keep), when that tag does not start a line as a real one does. Where what follows a
+    quoted parameter's tag is not the call's own structure, the quoted text goes on: a parameter the function does
+    not declare or has already (`shape`), a function end the call's end does not follow.
+    `final` falls back to the first structural close."""
     at = text.find(PARAM_END)
     fallback = -1
+    depth, counted = 0, 0       # quoted parameters open before `at`; how far the marks were counted
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
-        candidate = -1
+        for m in _PARAM_MARK.finditer(text, counted, at):
+            depth = depth + 1 if m.group().startswith(PARAM_START) else max(0, depth - 1)
+        counted = at
+        kind = ""               # "wait": undecided; "ok": the call's structure; "odd": structure it cannot take
         if after.startswith(PARAM_START):
             gt = after.find(">")
             if gt < 0:
-                candidate = at if final else -2
+                kind = "wait"
             elif name is None or after[len(PARAM_START):gt].strip() != name:
-                candidate = at
+                kind = "ok" if shape is None or shape.follows(after[len(PARAM_START):gt].strip()) else "odd"
         elif after.startswith(FUNC_END):
-            candidate = at
+            kind = "ok"
+            tail = after[len(FUNC_END):].lstrip()
+            if depth > 0 and not tail.startswith(CALL_END):
+                # the function's end after a quoted parameter may be quoted as well: the call's own is the one the
+                # call's end follows
+                kind = "odd" if tail and not CALL_END.startswith(tail) else "ok" if final else "wait"
         elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
-            candidate = at if final else -2
-        if candidate != -1:
-            if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
-                return candidate
-            if fallback < 0:
-                fallback = at
+            kind = "wait"
+        if kind:
+            if len(_QUOTED_OPEN.findall(text, 0, at)) > text.count(FUNC_END, 0, at):
+                fallback = at if fallback < 0 else fallback
+            elif kind == "wait":
+                return (at, False) if final else (-2, False)
+            elif kind == "odd" and depth > 0:
+                fallback = at if fallback < 0 else fallback
+            else:
+                return at, depth > 0 and at > 0 and text[at - 1] != "\n"
         at = text.find(PARAM_END, at + 1)
     # An unclosed quoted function must not hide the enclosing call at end of output.
-    return fallback if final else (-2 if fallback >= 0 else -1)
+    return (fallback, False) if final else ((-2, False) if fallback >= 0 else (-1, False))
 
 
-def call_end(text: str, final: bool = False) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, shape: CallShape | None = None) -> int:
+    """Where the tag found by param_close starts (-1, -2 as there)."""
+    return param_close(text, final, name, shape)[0]
+
+
+def call_end(text: str, final: bool = False, schemas: dict | None = None) -> int:
     """Where a call body ends: the `</tool_call>` after its own `</function>` (found via param_end); -1: incomplete.
-    A body not in the call format ends at the first `</tool_call>`."""
+    A body not in the call format ends at the first `</tool_call>`. `schemas`: the tools by name."""
     s = text.lstrip()
     pos = len(text) - len(s)
     if not s.startswith("<function="):
@@ -634,6 +675,7 @@ def call_end(text: str, final: bool = False) -> int:
     gt = text.find(">", pos)
     if gt < 0:
         return -1
+    shape = CallShape((schemas or {}).get(text[pos + len("<function="):gt]))
     pos = gt + 1
     while True:
         rest = text[pos:]
@@ -643,7 +685,9 @@ def call_end(text: str, final: bool = False) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final=final, name=text[pos:gt].split("=", 1)[1].strip())
+            pname = text[pos:gt].split("=", 1)[1].strip()
+            shape.given.add(pname)
+            end = param_end(text[gt + 1:], final=final, name=pname, shape=shape)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -822,13 +866,15 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     name = body[len("<function="):body.index(">")]
     rest = body[body.index(">") + 1:]
     props = _tool_properties(schema)
+    shape = CallShape(schema)
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
-        value = rest[:end] if end >= 0 else rest
+        shape.given.add(pname.strip())
+        end, keep = param_close(rest, final=True, name=pname.strip(), shape=shape)
+        value = rest[:end + (len(PARAM_END) if keep else 0)] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
@@ -884,6 +930,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.sshape = CallShape()
         self.spname = ""
         self.svstart = 0
 
@@ -904,6 +951,7 @@ class OutputParser:
                 name = rest[a + 10:b]
                 self.scall = ToolCall(name=name, arguments={})
                 self.sdeclared = _tool_properties(self.schemas.get(name))
+                self.sshape = CallShape(self.schemas.get(name))
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -920,6 +968,7 @@ class OutputParser:
                     self.sfirst = False
                     self.sp += b + 1
                     self.spname = pname
+                    self.sshape.given.add(pname.strip())
                     text, null = _text_kinds(self.sdeclared.get(pname))
                     if text and not null:
                         args('"')
@@ -941,10 +990,11 @@ class OutputParser:
                         rest = rest[1:]
                     self.sval_started = True
                     self.svstart = self.sp
-                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                end, keep = (param_close(self.buf[self.svstart:], final=final, name=self.spname, shape=self.sshape)
+                             if PARAM_END in rest else (-1, False))
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
-                    value = rest[:end]
+                    value = rest[:end + (len(PARAM_END) if keep else 0)]
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
@@ -960,10 +1010,10 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname)
+                end, keep = param_close(rest, final=final, name=self.spname, shape=self.sshape)
                 if end < 0:
                     return out
-                value = rest[:end]
+                value = rest[:end + (len(PARAM_END) if keep else 0)]
                 if value.startswith("\n"):
                     value = value[1:]
                 if value.endswith("\n"):
@@ -1073,11 +1123,11 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf, final=final)
+                i = call_end(self.buf, final=final, schemas=self.schemas)
                 if self.stream_tools:
                     if i >= 0:
-                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan(final=final)
+                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body, which is whole
+                        out += self._scan(final=True)
                         out += self._close_scan()
                         self.buf = whole
                     else:
