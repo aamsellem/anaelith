@@ -149,9 +149,12 @@ Upstream 0.4.0 on this machine, two sessions:
   of 3.09. Speed follows the clock, which is why a watt less in the processor shows. Heat builds up: three
   repetitions of `struct` back to back give 306, 292 and 270 tok/s.
 - **The experts on the GPU.** The stage profile (`--profile`) puts the GPU's own experts at 5.5 of 16.8 ms a window
-  on `conv` and 12.7 of 27.1 ms on `struct`, the largest stage in both. At about 5 us for an expert of 1.9 MiB that
-  is 40% of the card's memory bandwidth: these kernels are bound by decoding the quantized weights, at the clock the
-  heat allows.
+  on `conv` and 12.7 of 27.1 ms on `struct`, the largest stage in both. On one layer's weights with the clock
+  locked, the chain that computes 36 experts (71 MB) takes 157 us at 1.48 GHz, 121 at 1.96, 100 at 2.29 and 97 at
+  2.56: its time follows the clock up to 2.3 GHz, and at the 2.0 GHz the heat allows it reads 586 GB/s. A kernel
+  that only reads the same 71 MB gets 840 GB/s at 2.0 GHz and 850 at 2.8, so at that clock the card's memory is not
+  what holds the experts back. Nsight Compute has the gate/up kernel issue 1.7 instructions a cycle on an SM that
+  can issue 4, with no warp ready to issue 55% of the time.
 - **Not the CPU tier.** Three changes cut the CPU's expert work and left the speed where it was: the tier ranked
   across layers (18% fewer experts on the CPU in `conv`), every expert of layer 0 resident (that layer's wait on the
   CPU gone), and huge pages under the experts in RAM. Fewer workers do cost speed, so the tier is sized about right.
@@ -172,6 +175,13 @@ Upstream 0.4.0 on this machine, two sessions:
 - **Huge pages under the experts in RAM.** The arena is aligned for them but not requested, so with transparent
   huge pages in `madvise` mode it sits on 4 KiB pages. Requested, all 33 GiB are on 2 MiB pages; the CPU's time per
   expert stays within 1% and the start is a second faster.
+- **Other builds of the gate/up kernel**, each bitwise equal and timed at 2.0 GHz on one layer of each format for
+  windows of 1, 3 and 8 rows (upstream's build on an IQ2_S layer: 29.8, 59.1 and 122.2 us). Branch
+  `gu-kernel-builds`. Three or four blocks an SM instead of two: 0 to 8% slower, and with the row's passes kept as
+  a loop so that the registers fit, 2% faster to 7% slower. The grid read from the device table instead of shared
+  memory: 5 to 12% slower. A group's activation rows staged in shared memory: 1% faster to 20% slower. The next
+  rows prefetched: 2.5 to 4% slower. Every SM given to the kernel instead of seven in eight takes 4% off windows of
+  3 and 8 rows in this bench, where a decode's side streams do not run; it was not tried in a decode.
 - **A locked GPU clock** (`nvidia-smi -lgc`). On `struct`, six runs each: 291.6 tok/s at 2150 MHz and 283.0 at
   2000 MHz against 289.7 with the driver's own control. Under sustained heat the clock falls below the lock either
   way.
