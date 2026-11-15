@@ -132,9 +132,21 @@ static void test_tools() {
     CHECK(call_ok(g, head + city + metric + "<parameter=days>\n-3\n</parameter>\n</function>\n</tool_call>"));
     CHECK(call_ok(g, head + city + metric + "<parameter=unit>\nc\n</parameter>\n</function>\n</tool_call>"));
     CHECK(call_ok(g, head + city + metric + "<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n</function>\n</tool_call>"));
-    // a string may hold anything but the closing tag, newlines and angle brackets included
+    // a string may hold anything, newlines and angle brackets included
     CHECK(call_ok(g, head + "<parameter=city>\nline 1\nline <2> </param </parameter\n</parameter>\n" + metric + "</function>\n</tool_call>"));
-    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>"));
+    // ... and the closing tag itself, where the call's structure does not follow it: an edit of tool-call markup
+    CHECK(pre(g, head + "<parameter=city>\nab</parameter>"));
+    CHECK(call_ok(g, head + "<parameter=city>\nab</parameter> cd\n</parameter>\n" + metric + "</function>\n</tool_call>"));
+    CHECK(call_ok(g, head + "<parameter=city>\n<parameter=limit>40</parameter>\n</parameter>\n" + metric + "</function>\n</tool_call>"));
+    CHECK(call_ok(g, head + "<parameter=city>\n</parameter>\n</parameter>\n</parameter>\n" + metric + "</function>\n</tool_call>"));
+    // a tag the structure follows ends the value, wherever it stands: the value cannot swallow the rest of the call
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n<parameter="));
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n</function>"));
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n</tool_call>"));
+    CHECK(!pre(g, head + "<parameter=city>\nab</parameter>\n<tool_call>"));
+    // a call that skips the function's end is refused instead of read as text
+    CHECK(!pre(g, head + metric + "<parameter=city>\nParis\n</parameter>\n</tool_call>"));
+    CHECK(call_ok(g, head + metric + "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"));
     // a boolean must be JSON
     CHECK(!pre(g, head + city + "<parameter=metric>\nTrue"));
     CHECK(!pre(g, head + city + "<parameter=metric>\nyes"));
@@ -367,6 +379,57 @@ static void test_multibyte_text_end() {
     CHECK(call_ok(g, head + "a " + bar + " </ </\xef\xbd\x9d" + end));   // a near match and a neighbour character stay text
 }
 
+// A value may hold the closing tag where the form says so (text_holds_end): the tag ends the value only where the
+// call's structure follows it, as the server's parser reads it (serve/frontend.py param_end).
+static void test_text_holds_end() {
+    const char* kWrite = R"([{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},
+        "content":{"type":"string"}},"required":["path","content"]}}])";
+    std::string err;
+    auto g = Grammar::parse(tool_call_gbnf(kWrite, ToolGrammarOptions{}, err), err);
+    if (!g) std::printf("%s\n", err.c_str());
+    CHECK(g);
+    if (!g) return;
+    const std::string open = "<tool_call>\n<function=write>\n<parameter=path>\nprobe.txt\n</parameter>\n<parameter=content>\n";
+    const std::string close = "\n</parameter>\n</function>\n</tool_call>";
+    const std::string quoted = "<tool_call>\n<function=write>\n<parameter=path>\nx.txt\n</parameter>\n</function>\n</tool_call>";
+    // the values serve/tests/test_quoted_call_values.py keeps whole
+    CHECK(call_ok(g, open + "example transcript:\n" + quoted + "\nafter block" + close));
+    CHECK(call_ok(g, open + "example transcript:\n" + quoted + close));
+    CHECK(call_ok(g, open + "python3 - <<'PY'\nprint('''" + quoted + "''')\nPY" + close));
+    CHECK(call_ok(g, open + "A call starts with `<function=NAME>` and its parameters follow." + close));
+    CHECK(call_ok(g, open + "opener = \"<function=\"\n" + close));
+    CHECK(call_ok(g, open + "example:\n<function=foo>\n<parameter=x>\nunfinished" + close));
+    // a line of tool markup as the value: what an edit of a chat template or a parser writes
+    CHECK(call_ok(g, open + "<parameter=limit>40</parameter>" + close));
+    CHECK(call_ok(g, open + "if tag == \"</parameter>\":\n    depth -= 1" + close));
+    // the structure after a tag ends the value whatever white space stands between them
+    for (const char* gap : {"", " ", "\n", "\n\n", " \r\n\t"}) {
+        CHECK(!pre(g, open + "a</parameter>" + gap + "<parameter="));
+        CHECK(!pre(g, open + "a</parameter>" + gap + "</function>"));
+        CHECK(!pre(g, open + "a</parameter>" + gap + "</tool_call>"));
+        CHECK(pre(g, open + "a</parameter>" + gap + "<b>"));   // any other text after the tag stays in the value
+    }
+    // a model that takes a quoted tag for its value's own is held to the real one before the next parameter
+    const std::string first = "<tool_call>\n<function=write>\n<parameter=path>\n<parameter=limit>40</parameter>\n";
+    CHECK(!pre(g, first + "<parameter=content>"));
+    CHECK(pre(g, first + "</parameter>\n<parameter=content>\n"));
+    // and a call cannot end inside a value: the function's end must be written
+    CHECK(!pre(g, open + "text\n</parameter>\n</tool_call>"));
+
+    // a form whose parser ends a value at the first closing tag keeps the tag out of the text
+    ToolForm f = tool_form();
+    const ToolForm saved = f;
+    f.text_holds_end = false;
+    set_tool_form(f);
+    auto strict = Grammar::parse(tool_call_gbnf(kWrite, ToolGrammarOptions{}, err), err);
+    set_tool_form(saved);
+    CHECK(strict);
+    if (!strict) return;
+    CHECK(call_ok(strict, open + "plain text <b> </param" + close));
+    CHECK(!pre(strict, open + "ab</parameter>"));
+    CHECK(!pre(strict, open + "<parameter=limit>40</parameter>"));
+}
+
 // Boolean schemas: `true` is the empty schema (any value), `false` has no valid value.
 static void test_boolean_schemas() {
     std::string err;
@@ -454,6 +517,7 @@ int main() {
     test_union_parameters();
     test_control_escapes();
     test_multibyte_text_end();
+    test_text_holds_end();
     test_boolean_schemas();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");

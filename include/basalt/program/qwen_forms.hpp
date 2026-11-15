@@ -27,6 +27,7 @@ inline grammar::ToolForm qwen_tool_form() {
     f.param_mid_text = f.param_mid_value = ">\n";
     f.param_close = "\n</parameter>\n";
     f.text_end = "</parameter>";
+    f.text_holds_end = true;   // serve/frontend.py param_end ends a value where the structure follows the tag
     f.trigger = "<tool_call>";
     return f;
 }

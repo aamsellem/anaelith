@@ -3,6 +3,8 @@
 #include "basalt/program/grammar/schema.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -136,27 +138,139 @@ std::vector<std::string> utf8_chars(const std::string& s) {
     return out;
 }
 
-// Text that never contains the closing tag: a KMP automaton over the tag's characters, one rule per matched length.
-// The tag's last character is the one move the automaton refuses.
-std::string add_free_text(SchemaConverter& c, const std::string& tag) {
-    const std::vector<std::string> chars = utf8_chars(tag);
-    size_t n = chars.size();
-    std::set<std::string> alpha(chars.begin(), chars.end());
+namespace {
+bool is_space(const std::string& ch) { return ch == " " || ch == "\t" || ch == "\r" || ch == "\n"; }
+
+std::string trimmed(const std::string& t) {
+    size_t b = 0, e = t.size();
+    while (b < e && std::strchr(" \t\r\n", t[b]) != nullptr) ++b;
+    while (e > b && std::strchr(" \t\r\n", t[e - 1]) != nullptr) --e;
+    return t.substr(b, e - b);
+}
+
+// One string a parameter's free text may not contain, as characters; `gap`, when not negative, is the element
+// before which any run of white space may stand.
+struct TextEnd {
+    std::vector<std::string> chars;
+    int gap = -1;
+};
+
+// The strings a parameter's free text may not contain.
+//
+// A form whose parser ends a value at the first closing tag (text_holds_end off) excludes the tag itself.
+// Otherwise a value may hold the tag: an agent that edits tool-call markup writes one inside its argument, and the
+// server's parser (serve/frontend.py param_end) ends a value only where the call's structure follows a tag.  So the
+// text may not hold the tag followed, after any white space, by what a call writes after a parameter: another
+// parameter or the function's end.  The call's end and a new call are excluded there as well, though the parser would
+// read them as text: a call that skips the function's end is then refused instead of swallowed by the value.
+std::vector<TextEnd> free_text_ends(const ToolForm& form) {
+    std::vector<TextEnd> ends;
+    const std::vector<std::string> tag = utf8_chars(form.text_end);
+    if (form.text_holds_end && !tag.empty() && form.param_close.find(form.text_end) != std::string::npos) {
+        std::set<std::string> seen;
+        for (const std::string& next : {form.param_open, form.fn_close, trimmed(form.call_close), trimmed(form.call_open)}) {
+            if (next.empty() || !seen.insert(next).second) continue;
+            TextEnd e;
+            e.chars = tag;
+            e.gap = (int) tag.size();
+            for (const std::string& ch : utf8_chars(next)) e.chars.push_back(ch);
+            ends.push_back(e);
+        }
+    }
+    if (ends.empty()) ends.push_back(TextEnd{tag, -1});
+    return ends;
+}
+
+// A call quoted inside a value, as the parser counts one (`<function=NAME>` then a parameter or the function's end):
+// up to its own function end the structure may follow a closing tag, since it is the quoted call's.
+std::string add_quoted_call(SchemaConverter& c, const ToolForm& form) {
+    const std::string mid = trimmed(form.fn_mid);
+    if (!form.text_holds_end || form.fn_open.empty() || form.fn_close.empty() || form.param_open.empty() || mid.empty())
+        return "";
+    const std::vector<std::string> chars = utf8_chars(form.fn_close);
+    const size_t n = chars.size();
+    const std::set<std::string> alpha(chars.begin(), chars.end());
     std::string excluded;
     for (const std::string& a : alpha) excluded += a.size() == 1 ? hex_escape((unsigned char) a[0]) : a;
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {   // the text up to and with the function's end: its KMP automaton, ended by the match
         std::vector<std::string> alts;
         for (const std::string& a : alpha) {
             std::vector<std::string> seen(chars.begin(), chars.begin() + (std::ptrdiff_t) i);
             seen.push_back(a);
             size_t k = (std::min)(seen.size(), n);
             while (k > 0 && !std::equal(chars.begin(), chars.begin() + (std::ptrdiff_t) k, seen.end() - (std::ptrdiff_t) k)) --k;
-            if (k == n) continue;
-            alts.push_back(literal(a) + " free-text-" + std::to_string(k));
+            alts.push_back(k == n ? literal(a) : literal(a) + " quoted-text-" + std::to_string(k));
+        }
+        alts.push_back("[^" + excluded + "] quoted-text-0");
+        c.add_rule("quoted-text-" + std::to_string(i), join(alts, " | "));
+    }
+    c.add_rule("quoted-name", "[^\\x3c\\x3e\\x20\\x09\\x0d\\x0a]+");
+    c.add_rule("quoted-space", "[\\x20\\x09\\x0d\\x0a]*");
+    return c.add_rule("quoted-call", literal(form.fn_open) + " quoted-name " + literal(mid) + " quoted-space (" +
+                                         literal(form.param_open) + " quoted-text-0 | " + literal(form.fn_close) + ")");
+}
+}  // namespace
+
+// Text that never contains one of the form's excluded strings (free_text_ends), with quoted calls passed whole: the
+// automaton that reads every string at once, one rule per state.  A state is the set of places reached in the
+// strings; a move that would complete one of them is the move the automaton refuses, and the text may stop in any
+// state.  With the closing tag as the one string this is its KMP automaton, state i the matched length.
+std::string add_free_text(SchemaConverter& c, const ToolForm& form) {
+    const std::vector<TextEnd> ends = free_text_ends(form);
+    using State = std::set<std::pair<int, int>>;   // (string, characters matched)
+    std::set<std::string> alpha;
+    bool gaps = false;
+    for (const TextEnd& e : ends) {
+        alpha.insert(e.chars.begin(), e.chars.end());
+        gaps = gaps || e.gap >= 0;
+    }
+    if (gaps)
+        for (const char* ws : {" ", "\t", "\r", "\n"}) alpha.insert(ws);
+    const auto start = [&] {
+        State s;
+        for (int i = 0; i < (int) ends.size(); ++i) s.insert({i, 0});
+        return s;
+    };
+    const auto move = [&](const State& from, const std::string& ch) {
+        State to = start();
+        for (const auto& [i, j] : from) {
+            const TextEnd& e = ends[(size_t) i];
+            if (j < (int) e.chars.size() && e.chars[(size_t) j] == ch) to.insert({i, j + 1});
+            if (j == e.gap && is_space(ch)) to.insert({i, j});   // white space before the structure
+        }
+        return to;
+    };
+    const auto complete = [&](const State& s) {
+        for (const auto& [i, j] : s)
+            if (j == (int) ends[(size_t) i].chars.size()) return true;
+        return false;
+    };
+    const std::string quoted = add_quoted_call(c, form);
+    std::string excluded;
+    for (const std::string& a : alpha) excluded += a.size() == 1 ? hex_escape((unsigned char) a[0]) : a;
+    std::map<State, int> ids;
+    std::vector<State> states;
+    const auto id_of = [&](const State& s) {
+        const auto it = ids.find(s);
+        if (it != ids.end()) return it->second;
+        const int id = (int) states.size();
+        ids.emplace(s, id);
+        states.push_back(s);
+        return id;
+    };
+    id_of(start());
+    for (size_t at = 0; at < states.size(); ++at) {   // the states are found as their rules are written
+        const State from = states[at];
+        std::vector<std::string> alts;
+        for (const std::string& a : alpha) {
+            const State to = move(from, a);
+            if (complete(to)) continue;
+            alts.push_back(literal(a) + " free-text-" + std::to_string(id_of(to)));
         }
         alts.push_back("[^" + excluded + "] free-text-0");
+        if (!quoted.empty()) alts.push_back(quoted + " free-text-0");
         alts.push_back("\"\"");
-        c.add_rule("free-text-" + std::to_string(i), join(alts, " | "));
+        c.add_rule("free-text-" + std::to_string(at), join(alts, " | "));
     }
     return "free-text-0";
 }
@@ -344,7 +458,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     raw = true;
                 }
                 if (raw && value.empty()) {
-                    if (text_rule.empty()) text_rule = add_free_text(c, form.text_end);
+                    if (text_rule.empty()) text_rule = add_free_text(c, form);
                     value = text_rule;
                 }
                 if (!raw) {
