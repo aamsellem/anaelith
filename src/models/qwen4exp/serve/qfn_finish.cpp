@@ -31,6 +31,8 @@ Flow QfnRequest::complete_begin() {
                                                      " ms/window for it)").c_str());
         const std::string evr = basalt::core::decode_events().report();
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
+        const std::string wr = runtime_.ver.warm_report();
+        if (!wr.empty()) basalt::log::raw("basalt decode warm-up: %s\n", wr.c_str());
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
     }

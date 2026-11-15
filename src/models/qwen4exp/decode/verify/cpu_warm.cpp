@@ -79,10 +79,39 @@ void warm_select(CpuWarm& c) {
             score[e] += w[j] / sum;
         }
     }
-    int best = -1;
-    for (int e = 0; e < NE; ++e)
-        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+    // the n_read best, likeliest first (of equal scores the lower id, as the single pick did)
+    const int want = std::min(std::max(c.n_read, 1), (int) CpuWarm::kMaxRead);
+    int best[CpuWarm::kMaxRead];
+    int nb = 0;
+    for (int e = 0; e < NE; ++e) {
+        if (!(score[e] > 0.0f) || (nb == want && score[e] <= score[best[nb - 1]])) continue;
+        int j = nb < want ? nb++ : want - 1;
+        while (j > 0 && score[best[j - 1]] < score[e]) { best[j] = best[j - 1]; --j; }
+        best[j] = e;
+    }
+    for (int i = 0; i < CpuWarm::kMaxRead; ++i) {
+        c.pick[i] = i < nb ? best[i] : -1;
+        c.blob[i] = i < nb ? c.src->resident_blob(c.layer, best[i]) : nullptr;
+    }
+    c.n_pick = nb;
+}
+
+void warm_note(CpuWarm& c, const basalt::kernels::DmRing& R, int k) {
+    ++c.st_layers;
+    int32_t cpu[basalt::kernels::kDmCap];
+    int n_cpu = 0;
+    const int n = std::min(R.n_tok * k, (int) basalt::kernels::kDmCap);
+    for (int i = 0; i < n; ++i) {
+        if (R.kind[i] != -1) continue;
+        if (std::find(cpu, cpu + n_cpu, R.ids[i]) == cpu + n_cpu) cpu[n_cpu++] = R.ids[i];
+    }
+    c.st_cpu += (uint64_t) n_cpu;
+    if (c.ready.load(std::memory_order_acquire) == 0) return;   // the layer rang before the selection was done
+    ++c.st_ready;
+    for (int i = 0; i < c.n_pick; ++i) {
+        ++c.st_picks;
+        c.st_right += std::find(cpu, cpu + n_cpu, (int32_t) c.pick[i]) != cpu + n_cpu;
+    }
 }
 
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
@@ -97,19 +126,24 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
             _mm_pause();
         }
     }
-    // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
-    // rows, so a read the doorbell cuts short has warmed the start of the computation
-    if (c.blob == nullptr) return;
+    // this worker's share of each blob, likeliest expert first, one load per line: the gate and up rows first (computed
+    // first), then the down rows, so a read the doorbell cuts short has warmed the start of the computation
+    const size_t bytes = c.bytes[(size_t) c.layer], down_off = c.down_off[(size_t) c.layer];
     uint64_t x = 0;
-    for (int part = 0; part < 2; ++part) {
-        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
-        const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
-        const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
-        for (size_t o = b0; o < b1; o += 4096) {
-            if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
-            const uint8_t* p = c.blob + o;
-            const size_t n = std::min<size_t>(4096, b1 - o);
-            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+    bool cut = false;
+    for (int i = 0; i < CpuWarm::kMaxRead && !cut; ++i) {
+        const uint8_t* const blob = c.blob[i];
+        if (blob == nullptr) continue;
+        for (int part = 0; part < 2 && !cut; ++part) {
+            const size_t r0 = part == 0 ? 0 : down_off, r1 = part == 0 ? down_off : bytes;
+            const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
+            const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
+            for (size_t o = b0; o < b1; o += 4096) {
+                if (stop.load(std::memory_order_relaxed)) { cut = true; break; }
+                const uint8_t* p = blob + o;
+                const size_t n = std::min<size_t>(4096, b1 - o);
+                for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+            }
         }
     }
     if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
