@@ -204,6 +204,22 @@ bool Verifier::run_serve(PoolMultiFn pool, void* user, std::string& err) {
     }
 }
 
+std::string Verifier::warm_report() {
+    if (dm_ == nullptr || dm_->warm == nullptr) return std::string();
+    CpuWarm& w = *dm_->warm;
+    warm_pool_->idle_stop();
+    if (w.st_layers == 0) return std::string();
+    char b[256];
+    const double L = (double) w.st_layers;
+    std::snprintf(b, sizeof b, "%d expert%s read per layer; of %llu layer-windows the selection was done before the layer "
+                  "rang in %.1f%%; %.1f%% of its picks were routed to the CPU (%.2f picks of %.2f CPU experts per "
+                  "layer-window)", w.n_read, w.n_read == 1 ? "" : "s", (unsigned long long) w.st_layers,
+                  100.0 * (double) w.st_ready / L, w.st_picks ? 100.0 * (double) w.st_right / (double) w.st_picks : 0.0,
+                  (double) w.st_right / L, (double) w.st_cpu / L);
+    w.st_layers = w.st_ready = w.st_picks = w.st_right = w.st_cpu = 0;
+    return std::string(b);
+}
+
 int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
     using namespace basalt::kernels;
     if (ar_on()) return 1;   // the graph plans every layer on the device
@@ -254,6 +270,10 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
+        if (dm_ != nullptr && dm_->warm != nullptr && k > 0) {   // how this layer's warm-up turned out
+            warm_pool_->idle_stop();
+            warm_note(*dm_->warm, dm_->h_ring[k], (int) ss.k);
+        }
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -298,7 +318,8 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
             w.arrive.store(0, std::memory_order_relaxed);
             w.ready.store(0, std::memory_order_relaxed);
-            w.blob = nullptr;
+            w.n_pick = 0;
+            for (int i = 0; i < CpuWarm::kMaxRead; ++i) { w.blob[i] = nullptr; w.pick[i] = -1; }
             warm_pool_->idle_start(&warm_job, &w);
         }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();

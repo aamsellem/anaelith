@@ -393,6 +393,8 @@ public:
     int64_t windows = 0;
     /// --profile: GPU stage times of the windows since the last call (ms per window), as one line; empty when off.
     std::string profile_report();
+    /// --decode-timing: how the CPU tier's warm-up predictions turned out since the last call (empty: no warm-up).
+    std::string warm_report();
 
 private:
     struct WindowRecorder;
