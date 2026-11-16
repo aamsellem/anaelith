@@ -107,8 +107,8 @@ void QfnRequest::report_request(const DoneCounts& dc) {
     // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
     if (runtime_.adapt_fast && !runtime_.drive.d.usage.empty())
         basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
-                          "(no free RAM place)", (long long) (runtime_.xq_swapped - swapped0),
-                          (long long) (runtime_.xq_noplace - noplace0));
+                          "(no free RAM place), %lld windows waited for a round's copies", (long long) (runtime_.xq_swapped - swapped0),
+                          (long long) (runtime_.xq_noplace - noplace0), (long long) (runtime_.xq_landing_waits - landing0));
     // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
     // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
     if (runtime_.src.complement_ready())

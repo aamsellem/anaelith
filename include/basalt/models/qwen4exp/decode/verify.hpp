@@ -139,6 +139,12 @@ public:
     /// card the ring it was rung for, the ring it finished and whether its kernel still runs.  Empty without the
     /// device plan.
     std::string dm_note() const;
+    /// a stalled window's landed words (read on a side stream), the fence and post-launch state, then the hook's text
+    std::string landed_note() const;
+    /// after release_gpu_waits: whether the side read and the hook's streams finished once the window was released
+    std::string landed_after_release() const;
+    /// text a stalled window's error appends (the adaptive tier's state)
+    void set_diag_hook(std::function<std::string()> f) { diag_hook_ = std::move(f); }
 
     /// raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU cannot finish
     /// drains instead of staying resident, then wait up to `timeout_ms` for its streams.  For the paths that give up on
@@ -270,7 +276,7 @@ public:
     /// `f` runs on the calling thread of the next `run`, right after the window's graph is launched.
     void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
     /// runs it now if no window has since (a request ending)
-    void flush_post_launch() { if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); } }
+    void flush_post_launch() { if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; post_ran_at_ = std::chrono::steady_clock::now(); ++post_runs_; f(); } }
     /// `f` runs on the calling thread of the next `run`, once the host has served the last layer's ring (every routed
     /// entry of the window has been counted) and before the window's end is awaited.
     void set_served_hook(std::function<void()> f) { served_hook_ = std::move(f); }
@@ -616,6 +622,11 @@ private:
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     std::function<void()> post_launch_;
+    std::function<std::string()> diag_hook_;
+    mutable cudaStream_t diag_st_ = nullptr;   // landed_note's side read, checked again after the release
+    mutable uint32_t* diag_buf_ = nullptr;
+    std::chrono::steady_clock::time_point post_ran_at_{};   // the last post-launch run (landed_note)
+    uint64_t post_runs_ = 0;
     std::function<void()> served_hook_;
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
     bool landed_glue_ = true;             // every device-planned layer captured so far ran dec_moe_glue

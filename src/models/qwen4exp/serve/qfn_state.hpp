@@ -293,6 +293,13 @@ private:
     uint32_t* xq_pin{};
     cudaEvent_t p2p_ev{};
     bool xq_unsettled{};
+    // stall diagnostics: how the round in flight queued its incoming copies (0 none, 1 after the next launch,
+    // 2 at once) and when its steps ran
+    int xq_mode{};
+    std::chrono::steady_clock::time_point xq_t1{}, xq_t2{};
+    uint64_t xq_rounds_words{};
+    // windows that ran before a round's copies had landed, the round kept for the next one (xq_advance)
+    int64_t xq_landing_waits{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
     int S{};
     int S_mtp{};
