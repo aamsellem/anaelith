@@ -75,6 +75,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `reasoning-effort` | entry | `none`, `low`, `medium`, `high`, `xhigh` or `max` | unset (the template's default) | Reasoning effort for requests that name no effort, thinking switch or budget. See [sampling](sampling.md). |
 | `reasoning-budget-tokens` | entry | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
 | `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
+| `crash-resume` | entry | integer | `0` | When the engine dies during a request, restart it and resume the answer after the tokens already written, up to N times per request; `0` ends the request with an error. |
 | `answer-room` | entry | `auto` or integer | `auto` | Output tokens kept for closing the thinking and the answer: `auto`, or a fixed number (`0`: none). See [sampling](sampling.md#thinking). |
 | `config` | command line | path | none | The config file. Command line only. |
 

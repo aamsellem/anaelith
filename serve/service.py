@@ -150,6 +150,8 @@ class Service:
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
         self.reasoning_effort: str | None = None         # effort for a request that names none (None: the template's)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
+        self.crash_resume = 0                            # an engine that dies mid-request is restarted and the answer
+                                                         # resumed after its written tokens, up to N times (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
 
@@ -1245,6 +1247,7 @@ class Service:
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
+                    resumes = 0                         # engine deaths this request was resumed after (--crash-resume)
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
@@ -1271,6 +1274,7 @@ class Service:
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
                         resumed = False                 # stopped for answer now, but not at a point to close: go on
+                        crashed = False                 # the engine died in this pass and the request resumes
                         ended_thinking = False          # the turn ended inside the thinking
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -1367,7 +1371,9 @@ class Service:
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
-                            raise
+                            if resumes >= self.crash_resume or cancel.is_set() or self.stopping.is_set():
+                                raise
+                            crashed = True              # restarted below; the next pass extends what was written
                         except ValueError as e:             # the engine's ERR line
                             finish = "error"
                             print(f"[server] error: engine reported {e}", flush=True)
@@ -1381,7 +1387,7 @@ class Service:
                             except EngineSilent as e:   # the STOP was never acknowledged
                                 finish = "error"
                                 self._say_died(e)
-                                if not leaving and not cancel.is_set():
+                                if not leaving and not cancel.is_set() and not crashed:
                                     raise
                         run_last = getattr(self.engine, "last", None)
                         with self.status_lock:
@@ -1409,6 +1415,15 @@ class Service:
                                 wrap = asked = True
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
+                        if crashed and not cancel.is_set():
+                            resumes += 1
+                            print(f"[server] the engine stopped mid-request: restarting it and resuming after the "
+                                  f"{len(seg)} tokens of this pass (resume {resumes} of {self.crash_resume})", flush=True)
+                            # restart a dead engine; parallel requests serialize this start on the fifo
+                            with (self.fifo if par else contextlib.nullcontext()):
+                                self.ensure_loaded()
+                            finish = "length"
+                            resumed = True
                         if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this

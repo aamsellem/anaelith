@@ -24,7 +24,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
     "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
-    "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
+    "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "crash-resume", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
@@ -614,6 +614,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
                     help="end the thinking and let the model answer when it repeats one token this many times in a "
                          "row inside the thinking (0 = never)")
+    ap.add_argument("--crash-resume", type=budget_count, default=0, metavar="N",
+                    help="when the engine dies during a request, restart it and resume the answer after the tokens "
+                         "already written, up to N times per request (0 = off: the request ends with an error)")
     ap.add_argument("--video-max-tokens", type=video_tokens, default=VIDEO_MAX_TOKENS, metavar="N",
                     help=f"the most image tokens one video may take over all its frames (default {VIDEO_MAX_TOKENS}): "
                          "frames are sampled at 2 a second (4 to 768; a request's video part may ask fps and "
