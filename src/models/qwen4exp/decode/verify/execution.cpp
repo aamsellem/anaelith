@@ -163,7 +163,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
     (void) cudaStreamQuery(cs_);
-    if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
+    if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; post_ran_at_ = Clock::now(); ++post_runs_; f(); }
     gm.mark(15);
     fl_.T = T;
     fl_.pos0 = pos0;
@@ -265,8 +265,9 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - fl_.wait_t0 > std::chrono::seconds(20)) {
                 // the caller ends the engine; no spin kernel may outlive it
                 const std::string words = dm_note();   // read before the release overwrites them
+                const std::string landed = landed_note();
                 const bool drained = release_gpu_waits(5000);
-                err = "verify: timed out at layer " + std::to_string(l) + words + released_note(drained) + peer_released();
+                err = "verify: timed out at layer " + std::to_string(l) + words + landed + released_note(drained) + landed_after_release() + peer_released();
                 return -1;
             }
             return 0;

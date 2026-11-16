@@ -89,6 +89,7 @@ void QfnRequest::decode_stats_begin() {
     decode_hits0 = runtime_.drive.d.cache_hits;
     swapped0 = runtime_.xq_swapped;
     noplace0 = runtime_.xq_noplace;
+    landing0 = runtime_.xq_landing_waits;
     // the RAM and file tiers of this request (the mmap source; 0 with the arena)
     ram0 = runtime_.src.ram_reads();
     files0 = runtime_.src.file_reads();
