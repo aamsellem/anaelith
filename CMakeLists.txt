@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.4.0 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.4.1 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -114,7 +114,9 @@ else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
   set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni;-mbmi2")
-  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8")
+  # -mno-avx512f keeps the file below EVEX under a global -march=native: there vpdpbssd lands on ymm16+, which
+  # only its AVX10.2 form encodes, so the assembler refuses it or emits an instruction AVX-512 CPUs do not run.
+  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8;-mno-avx512f")
   set(_isa_avx1_flags "-mavx")
 endif()
 
@@ -595,6 +597,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/serve/request_parse.cpp
             src/program/serve/request_prefill.cpp
             src/program/serve/request_restore.cpp
+            src/program/serve/prompt_handles.cpp
             src/program/serve/session_engine.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
@@ -1443,6 +1446,11 @@ if(BUILD_TESTING)
   add_executable(conv_cache_test tests/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   basalt_cpu_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # a held conversation met against a prompt, the model's own pieces standing for the same bytes (header-only, CPU)
+  add_executable(prefix_anchor_test tests/program/prefix_anchor_test.cpp)
+  target_include_directories(prefix_anchor_test PRIVATE src)
+  target_link_libraries(prefix_anchor_test PRIVATE warnings)
+  basalt_cpu_test(NAME prefix_anchor_test COMMAND prefix_anchor_test)
   # where a prompt read from token 0 places the chain's root: the system prompt's end, never the reply's header (CPU)
   add_executable(prompt_parts_test tests/program/prompt_parts_test.cpp)
   target_include_directories(prompt_parts_test PRIVATE src)
