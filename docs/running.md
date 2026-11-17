@@ -83,6 +83,15 @@ reads one that does not fit whole in free RAM with its K/V going from the files 
 whole conversation, only for the write buffer or the running states. When even that is not free above the disk tier's floor, the
 conversations parked in RAM are written to disk first, the longest parked first, until it is.
 
+## Conversations in VRAM: `--kv-pool`
+
+Off by default. Qwen3.8-Flash-Next on one card, with elastic KV and without `--parallel`. A conversation the session switches away from
+stays in VRAM, beside the live one, until their tokens together would pass `--max-context` (each pooled one also counts its running state,
+about 124 MiB): then the oldest leaves first. A prompt that continues a pooled conversation goes on from where it ended, without reading it
+again, and needs no free RAM. The pool takes its VRAM from the expert cache, never below the slots a prompt chunk needs, and gives way when
+the live conversation grows. Each pooled conversation keeps its deepest checkpoint in RAM (the system prompt's stays with the session). `SLEEP` drops the
+pool. The log lines start with `kv pool:`.
+
 ## Sleep: `--idle-sleep`
 
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
