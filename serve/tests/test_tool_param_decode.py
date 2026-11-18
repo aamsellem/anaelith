@@ -18,6 +18,8 @@ TOOL = {"name": "write_note", "parameters": {"type": "object", "properties": {
     "mixed": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
     "count": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
     "n": {"type": "integer"},
+    "flag": {"type": "boolean"},
+    "maybe": {"type": ["boolean", "null"]},
     "free": {},
 }}}
 
@@ -36,6 +38,14 @@ class ParseToolCall(unittest.TestCase):
             self.assertEqual(self.arg(name, "123"), "123", name)
             self.assertEqual(self.arg(name, "true"), "true", name)
             self.assertEqual(self.arg(name, '["a"]'), '["a"]', name)
+
+    def test_python_booleans_are_booleans_where_boolean_is_declared(self):
+        self.assertIs(self.arg("flag", "True"), True)
+        self.assertIs(self.arg("flag", "False"), False)
+        self.assertIs(self.arg("maybe", "False"), False)
+        self.assertIs(self.arg("flag", "true"), True)
+        self.assertEqual(self.arg("plain", "True"), "True")
+        self.assertEqual(self.arg("free", "True"), "True")
 
     def test_null_is_null_only_where_null_is_a_type(self):
         for name in ("path", "one", "listed"):

@@ -793,7 +793,12 @@ def _decode_param(value: str, schema) -> object:
     try:
         return json.loads(value)
     except ValueError:
-        return value
+        pass
+    # A declared boolean written the Python way (True / False) is the boolean, not the text.
+    t = schema.get("type") if isinstance(schema, dict) else None
+    if (t == "boolean" or (isinstance(t, list) and "boolean" in t)) and value.strip() in ("True", "False"):
+        return value.strip() == "True"
+    return value
 
 
 def _deref(root: dict, schema):
