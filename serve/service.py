@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
@@ -288,8 +289,10 @@ class Service:
                 time.sleep(0.5)
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
+                held = vram.holders([int(getattr(self, "gpu_index", 0) or 0)])
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+                              f"{self.min_free_vram_mib} (min_free_vram_mib)" + (f"; held by {held}" if held else "") +
+                              " - it stays unloaded until that is free")
         if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
             print("[server] restarting the vision encoder", flush=True)
             self.vision.restart()
@@ -404,12 +407,38 @@ class Service:
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
         try:
-            self.engine.wake()
+            self.engine.wake(vram_check=self._wake_vram_check)
+        except WakeBlocked as e:                        # nothing was touched: it stays asleep until the memory is free
+            print(f"[server] error: the model cannot wake: {e}", flush=True)
+            raise GpuBusy(f"the model cannot wake: {e}") from None
         except (ValueError, EngineDied) as e:
             print(f"[server] warning: waking the model failed ({e}); loading it again", flush=True)
             return
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
+
+    WAKE_VRAM_WAIT_S = 15.0                              # for memory just released elsewhere
+
+    def _wake_vram_check(self, parked: dict[int, int] | None) -> str | None:
+        """Whether the VRAM a sleeping engine's state needs is free again on each card; None if so (or unknown), else who
+        holds it. The driver restores the state at its old addresses, so each card's memory has to be there as it was: a
+        restore into a card someone else filled fails halfway, and the state is then lost."""
+        if not parked:
+            return None
+        deadline = time.time() + self.WAKE_VRAM_WAIT_S
+        while True:
+            short = {}
+            for g, need in parked.items():
+                free = vram.free_mib(g)
+                if free is not None and free < need:
+                    short[g] = (need, free)
+            if not short:
+                return None
+            if time.time() >= deadline:
+                held = vram.holders(list(short))
+                what = "; ".join(f"GPU {g} needs {n} MiB and has {f} MiB free" for g, (n, f) in short.items())
+                return what + (f"; held by {held}" if held else "") + " - the model stays asleep until that is free"
+            time.sleep(0.5)
 
     sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
@@ -458,7 +487,10 @@ class Service:
 
     def _sleep_fits(self) -> str | None:
         """Whether the GPU memory the engine still holds fits in RAM with the margin left; None if so, else why not."""
-        used = self.used_vram_mib()
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        used = vram.process_mib(pid) if pid else None    # the engine's own memory: what the driver moves to RAM
+        if used is None:
+            used = self.used_vram_mib()
         avail = available_ram_mib()
         if used is None or avail is None:
             return None if avail is not None else "RAM unreadable"
@@ -517,9 +549,7 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            if getattr(self.engine, "asleep", False) is True:
-                self._wake()
-            self.engine.unload()
+            self.engine.unload()                        # a sleeping engine is resumed (or killed) by its close()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}, the next request loads it", flush=True)
@@ -1171,6 +1201,7 @@ class Service:
             opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
+        prompt_ms0 = None                               # the first engine run's prompt read time
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -1405,6 +1436,7 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                            prompt_ms0 = run_last.get("prompt_ms")    # the prompt is read in that run only
                         if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
                                 wrap = True             # the budget's last token: close the thinking
@@ -1453,7 +1485,7 @@ class Service:
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
                             # before a call
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
                             force = None
                             extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
@@ -1478,6 +1510,9 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif finish == "length" and n < max_new and self.stopping.is_set():
+                        finish = "error"                # the engine's QUIT ended the reply short of its cap
+                        raise EngineDied("the server is stopping")
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise
@@ -1490,6 +1525,8 @@ class Service:
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
+                                if prompt_ms0 is not None:
+                                    last["prompt_ms"] = prompt_ms0
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups

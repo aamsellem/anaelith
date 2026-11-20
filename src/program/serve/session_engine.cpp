@@ -41,15 +41,14 @@ struct Block {
 
 class SessionRuntime final : public Runtime {
 public:
-    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::LoadedModel& model)
-        : Runtime(options, file, error, model.desc().n_vocab, vocab_), model_(model) {}
+    SessionRuntime(CommonOptions& options, basalt::core::ModelFile& file, std::string& error, basalt::model::Started& started)
+        : Runtime(options, file, error, started.model->desc().n_vocab, vocab_), model_(*started.model),
+          sessions_(std::move(started.sessions)) {}
 
     int init_before_input() override {
-        const int slots = std::max(o.batch, 1);
-        sessions_.resize((size_t) slots);
-        for (auto& s : sessions_) {
-            const basalt::model::Result r = model_.make_session(s);
-            if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
+        if (sessions_.size() != (size_t) std::max(o.batch, 1)) {   // the start makes one per slot
+            basalt::log::error("basalt serve", "the model has %zu sessions for %d slots", sessions_.size(), std::max(o.batch, 1));
+            return 1;
         }
         // one policy for the solo windows and one for the batch windows, whose rounds cost differently
         policy.emplace(session().max_window());
@@ -120,6 +119,7 @@ public:
         // whether the in-engine encoder reads video: FFmpeg found, for a model that reads the shared patches
         if (o.vision_in_engine && sessions_[0]->reads_patches()) std::printf("%s\n", basalt::vision::video_line().c_str());
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
+        kv_ceiling_note();
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;
@@ -228,6 +228,15 @@ public:
         return written;
     }
     bool park_idle_engine(std::string&) override { return false; }
+    // a model with an elastic KV: its ceiling as an INFO line whenever it moves (the server reports it in /v1/status)
+    int64_t kv_ceiling_sent_ = -1;
+    void kv_ceiling_note() override {
+        const int64_t n = sessions_[0]->kv_ceiling();
+        if (n < 0 || n == kv_ceiling_sent_) return;
+        kv_ceiling_sent_ = n;
+        std::printf("INFO elastic_kv_ceiling=%lld\n", (long long) n);
+        std::fflush(stdout);
+    }
     bool capture_admit(uint64_t need, uint64_t floor) override {
         return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
                basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
@@ -972,6 +981,12 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_chunk(pr);
             at = end;
         }
+        if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
+            basalt::log::warn("basalt serve", "%s", r.message.c_str());
+            rt_.session().end_prompt();
+            std::printf("ERR %s\n", r.message.c_str());
+            return Flow::next;
+        }
         if (!r.ok()) {
             basalt::log::error("basalt serve", "%s", r.message.c_str());
             std::printf("ERR %s\n", r.message.c_str());
@@ -1063,9 +1078,9 @@ void SessionRuntime::enc_command(const std::string& cmd) {
 }  // namespace
 
 int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::model::ModelAdapter& adapter,
-                basalt::model::LoadedModel& model) {
+                basalt::model::Started& started) {
     std::string err;
-    SessionRuntime runtime(o, file, err, model);
+    SessionRuntime runtime(o, file, err, started);
     runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }

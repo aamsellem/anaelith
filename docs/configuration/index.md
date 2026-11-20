@@ -59,6 +59,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `host` | server | address | `127.0.0.1` | Listen address. `0.0.0.0` serves the network; never without `api-key`. |
 | `port` | server | integer | `8080` | TCP port. |
 | `api-key` | command line | string | none | Require this key on `/v1/*` (`Authorization: Bearer` or `x-api-key`). Command line only. |
+| `api-key-file` | command line | path | none | Read that key from the first line of this file, which keeps it out of the process list. Not with `api-key`. Command line only. |
 | `allowed-host` | server | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
 | `cors-origin` | server | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
 | `fit-max-tokens` | entry | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
@@ -113,7 +114,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | Flash-Next only. With `mmap-experts`: keep RAM-resident experts in ordinary RAM. |
 | `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
-| `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. |
+| `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. A count is honoured exactly or the start is refused with a one-line message (what fits, the free VRAM, the reserve); it is never trimmed. |
 | `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
 | `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
