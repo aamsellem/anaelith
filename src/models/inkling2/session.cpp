@@ -305,6 +305,7 @@ public:
 
     // DSPARK HOOK: the drafter's windows (the anchor and up to seven drafts) and blocks
     int max_window() const override { return dspark_.on() ? std::clamp(m_.flags().spec, 1, kMaxRows) : 1; }
+    bool copy_drafts() const override { return max_window() > 1; }   // prompt lookup: any window's rows verify alike
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override { return dspark_.draft_begin(anchor, pos, n, stream_); }
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
         return dspark_.draft_end(ids, conf, max_n, n, need, stream_);
@@ -487,7 +488,7 @@ public:
         const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
         uint64_t ram = 0;
         for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + " " +
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
                program::spill_words({0, expert_pairs(), 0});
     }
 
