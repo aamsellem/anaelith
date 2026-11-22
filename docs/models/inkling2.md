@@ -43,10 +43,20 @@ the text model.
   drafter's full layer; the window layers' rings do not grow.
 - **Experts in RAM when the context needs the room:** when the asked context does not fit beside every expert, the least
   routed experts (by the shipped profile `data/profiles/inkling2-24x128.prof`) are planned into page-locked RAM, just enough,
-  and decode reads them there over the bus. The full visits' caches then back their first 32,768 positions and grow as prompts
+  and decode computes them on the CPU: after a layer's router its rows go to RAM, the CPU pool (`--pool-workers`) runs the
+  pairs whose expert is in RAM while the card runs the rest, and the card takes their rows before it combines them. The
+  full visits' caches then back their first 32,768 positions and grow as prompts
   need them, and the experts planned into RAM are copied back to the card while the caches leave room, the least routed
   giving way first when they grow. A short chat at `--max-context 1048576 --kv fp8` keeps every expert on the card. On a
   smaller card the spill is static: what does not fit stays in RAM. Nothing changes when everything fits.
+- **Sleep and lending:** `--idle-sleep` and `POST /v1/vram` ([running](../running.md#sleep---idle-sleep)) use the same copies.
+  At a sleep the card's copies of the RAM experts go back to RAM (the CPU computes them) and the driver moves the rest
+  of the GPU state to host memory; the wake takes the copies back while the card has room. `reserve_mib` resizes them the
+  same way: copies go back when the card has less than that free, return when it has more. Only the copies are lendable:
+  the experts a pack keeps on the card have no RAM copy, so a reserve above what the copies free is refused (`400`), and an
+  engine with every expert on the card gives nothing back before the driver moves it. No `--vram-elastic` (Flash-Next's
+  segmented cache) is needed or accepted. At `--max-context 1048576 --kv fp8` on an RTX 5090 with images on the card holds
+  28.4 GB awake and 20 MiB asleep; the wake takes about 2 s and every token after it equals the one before.
 
 ## Long prompts
 
@@ -71,12 +81,19 @@ more from it than from the block: a 2,405-token copy prompt decodes 13 % faster.
 
 ## Parallel slots
 
-Not measured. `--parallel N` starts N sessions, each with its own caches and drafter scratch, the context split between them.
+`--parallel N` starts N sessions, each with its own caches, rings and drafter context; the forward's scratch, the prompt path
+and the drafter's tap are one for all of them. The busy slots decode together, one pass through the weights of up to 8 rows
+([batched decoding](../design/batching.md)), the rows going to the drafts likeliest kept. A request alone in its slot gives the
+same greedy tokens as with `--parallel 1`, and requests decoding together each give the tokens they give alone.
 
 ## Images
 
-`--vision dynamic` ([vision](../running.md#vision---vision)). The engine's own encoder reads a picture at its size, padded to
-multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488 picture takes 208 tokens. A picture of more than 10,609 cells
+`--vision dynamic` ([vision](../running.md#vision---vision)) keeps no card memory, so the context that keeps every expert on
+the card is the same as without it. A request's pictures borrow the encoder's region (up to 1.37 GiB) from the experts: the
+card copies of RAM experts go back first, then whole layers' experts are copied to RAM and come back byte for byte at the
+same addresses after the pictures (one layer, about 0.3 s a request on an RTX 5090 with every expert on the card). The
+engine's own encoder reads a picture at its size, padded to multiples of 40 pixels, one token per 40 x 40 cell: a 640 x 488
+picture takes 208 tokens. A picture of more than 10,609 cells
 (about 4,120 x 4,120) is scaled down to fit (bicubic). Transparent pixels are laid over the reference processor's grey
 checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the model tends to call such a background black.
 
@@ -88,11 +105,18 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
   tokens), so leave room in `max_tokens`.
 - **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.
+  The server also reads the forms the model drifts into: a call whose header has no name, or has no header at all (the name
+  is in its JSON), a call written after a block it left open or cut off before its end, and a call written as XML
+  (`<invoke name="..."><parameter name="...">...</parameter></invoke>`, bare or inside `<tool_call><function_calls>`, with
+  or without `string="true"`) when it names one of the request's tools. Tags quoted in code, or naming no tool of the
+  request, stay text.
 
 ## Limits
 
-- One card: no second card and no layer split. Experts read from RAM cost a bus read each, so a spilled card decodes slower
-  (an RTX 5060 Ti with about 740 experts in RAM: 53 to 67 tok/s).
+- One card: no second card and no layer split. Experts in RAM run on the CPU, so a spilled card decodes slower than a full
+  one: an RTX 5060 Ti alone at 180 W with a Ryzen 9 9950X and about 1,100 experts in RAM decodes conversation at 59 tok/s,
+  struct at 118 and prose at 53, about 2.6 times as fast as reading them over the bus; prompts read as before (2,430 tok/s
+  at 16K).
 - The server's `decode expert cache hit rate` line reads 100 % on a spilled load; the engine's `experts: ... on the card`
   line at the end of a session is the real share.
 - No video.
