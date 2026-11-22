@@ -166,8 +166,12 @@ class Parse(unittest.TestCase):
                 self.assertEqual(merged(parse(reply, chunk)), want, chunk)
 
     def test_a_whole_call_without_its_end_is_a_call(self):
-        reply = HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"one"}}'
-        self.assertEqual(merged(parse(reply))[-1], ("call", "search", {"q": "one"}))
+        # the streamed argument text is the arguments' JSON alone, without the call object's closing brace
+        for reply in (HEADER + "search" + TOOL_JSON + '{"name":"search","args":{"q":"one"}}',
+                      TOOL_JSON + '{"name":"search","args":{"q":"one"}}'):
+            for chunk in (None, 1, 4):
+                self.assertEqual(merged(parse(reply, chunk))[-2:], [("args", '{"q":"one"}'), ("call", "search", {"q": "one"})],
+                                 (reply, chunk))
 
     def test_a_bare_marker_with_no_name_is_text(self):
         reply = TOOL_JSON + '{"args":{"q":"one"}}' + END

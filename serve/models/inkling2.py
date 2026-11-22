@@ -217,8 +217,12 @@ class Inkling2Parser:
                 self._start(out)
             if self.stream_tools and self.call is not None and self.started:
                 args = self._args_text()
-                if args is not None and len(args) > self.streamed:
-                    out.append(Event("tool_args", args[self.streamed:], call=self.call))
+                if args is not None:
+                    upto = len(args)
+                    if whole and args.rstrip().endswith("}"):     # the call object's own closing brace, as in _call
+                        upto = len(args.rstrip()) - 1
+                    if upto > self.streamed:
+                        out.append(Event("tool_args", args[self.streamed:upto], call=self.call))
             if whole:                   # the JSON is whole, only the block's end is missing: still a call
                 self._end_call(out)
             self.call = None
