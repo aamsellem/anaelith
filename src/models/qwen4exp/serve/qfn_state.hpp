@@ -40,7 +40,6 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/image_loan.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
@@ -289,6 +288,10 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    // --diag-fixed-experts: the windows' residency tables, no expert in VRAM (the host's, and one per card), so the CPU
+    // pool computes every row of a window whatever the cards hold
+    std::vector<int32_t> fixed_res{};
+    std::vector<std::pair<int, int32_t*>> fixed_res_d{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};
@@ -449,6 +452,7 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
+    bool fixed_experts(basalt::core::VerifyHits& h, int dev);
     bool capture_admit(uint64_t need, uint64_t floor) override;
     // The disk tier a buffer at a time: a conversation that goes only to disk is written from the session, and one
     // on disk that RAM does not admit whole is read with its K/V going from the files into the session.
