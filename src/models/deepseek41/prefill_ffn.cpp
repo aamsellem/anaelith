@@ -6,6 +6,7 @@
 // experts and a share of the RAM ones, read over its own link, beside the main card (prefill::PeerShare); in a short chunk
 // the CPU also takes RAM experts with few rows. Their rows join the main card's before the weighted sum. Shared: the dense
 // matvec over columns of up to eight tokens.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
 
@@ -123,7 +124,7 @@ public:
         all = routed;
         const int64_t nf = (int64_t) g_.n_ff_exp * std::max(g_.n_shared, 1);
         const std::pair<const char*, int64_t> shexp[] = {{"ffn_gate_shexp.weight", nf}, {"ffn_up_shexp.weight", nf},
-                                                         {"ffn_down_shexp.weight", g_.n_embd}};
+                                                         {"ffn_down_shexp.weight", g_.n_embd}, {"engram_kv.weight", 5 * g_.n_embd}};
         for (int il = 0; il < g_.n_layers; ++il)
             for (const auto& [name, rows] : shexp)
                 if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
@@ -166,7 +167,7 @@ public:
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= g_.n_expert) {
@@ -318,6 +319,33 @@ public:
             swiglu_clamped(sg, su, nf * nc, g_.clamp_shexp[(size_t) il], h_, stream);
             mmq::quantize(h_, nullptr, xq2_, dn->type, nf, nf, nc, stream);
             dense(dn, n, nf, xq2_, nc, out + (size_t) t0 * n, stream);
+        }
+        return true;
+    }
+
+    bool dense_rows(const void* w, int type, int rows, int cols, const float* x, int T, float* out, void* stream) override {
+        namespace mmq = basalt::prefill::mmq;
+        if (!mmq::fits(type, rows) || mmq::q8_bytes(kSharedRows, cols) > mmq::q8_bytes(max_rows_, g_.n_embd)) return false;
+        for (int t0 = 0; t0 < T; t0 += kSharedRows) {
+            const int nc = std::min(kSharedRows, T - t0);
+            const int32_t b[2] = {0, nc};
+            cudaMemcpyAsync(sbnd_, b, sizeof b, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+            mmq::quantize(x + (size_t) t0 * cols, nullptr, xq1_, type, cols, cols, nc, stream);
+            basalt::prefill::mmq::Product p;
+            p.w = w;
+            p.type = type;
+            p.w_rows = rows;
+            p.w_cols = cols;
+            p.expert_bytes = mmq::matrix_bytes(type, rows, cols);
+            p.n = 1;
+            p.xq = xq1_;
+            p.bounds = sbnd_;
+            p.ids = ident_;
+            p.total_rows = nc;
+            p.max_rows = nc;
+            p.dst = out + (size_t) t0 * rows;
+            p.ld_dst = rows;
+            ctx_.run(p, stream);
         }
         return true;
     }
@@ -493,7 +521,7 @@ private:
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
         if (rows == 0) return true;
-        if (cudaMemcpy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (basalt::core::device_copy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "deepseek41: reading a short read's activations failed";
             return false;
         }
@@ -701,7 +729,7 @@ private:
         }
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) NE);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= NE) {

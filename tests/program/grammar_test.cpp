@@ -313,6 +313,41 @@ static void test_patterns() {
     GrammarState c(r, rt);
     CHECK(!c.accept("g", 1) && !c.active());      // the trigger fires, the grammar wants token 5: refused, unchanged
     CHECK(c.accept("g", 5) && c.active() && c.accept("x") && c.accepting());
+    // bounded pattern after a long inactive prefix (past tail trim) still matches across token boundaries,
+    // preserves capture-group offsets and replayed token ids, and rolls back cleanly on failed fire
+    auto mg = parse("root ::= \"<|message_model|>\" [a-z]+ \"<|end|>\"");
+    Triggers mt;
+    mt.patterns = {"<\\|message_model\\|>[^<]"};
+    GrammarState ms(mg, mt);
+    for (int i = 0; i < 2000; ++i) CHECK(ms.accept("hello world ", 10) && !ms.active());
+    CHECK(ms.accept("<|message_model|>", 20) && !ms.active());
+    CHECK(!ms.accept("1", 21) && !ms.active());   // fires on "<|message_model|>1", grammar rejects '1', rolls back
+    CHECK(ms.accept("ab", 22) && ms.active());    // previous header piece survived rollback and matches now
+    CHECK(ms.accept("c<|end|>", 23) && !ms.active() && ms.accepting());
+    // capture group inside a bounded pattern after tail trim (lo > 0)
+    Triggers cap;
+    cap.patterns = {"pre_(<c>)"};
+    GrammarState cs(g, cap);
+    for (int i = 0; i < 400; ++i) CHECK(cs.accept("padding ", 1) && !cs.active());
+    CHECK(cs.accept("pre_<", 2) && !cs.active());
+    CHECK(cs.accept("c>xy", 3) && cs.active());
+    CHECK(cs.accept("</c>", 4) && !cs.active());
+    // token reference inside a bounded multi-token trigger after tail trim
+    auto rg = parse("root ::= <[5]> <[6]> \"z\"");
+    Triggers rgt;
+    rgt.patterns = {"ab"};
+    GrammarState rs(rg, rgt);
+    for (int i = 0; i < 400; ++i) CHECK(rs.accept("----", 1) && !rs.active());
+    CHECK(rs.accept("a", 5) && !rs.active());
+    CHECK(!rs.accept("b", 9) && !rs.active());    // wrong id for 'b': rolls back keeping token 5's 'a'
+    CHECK(rs.accept("b", 6) && rs.active() && rs.accept("z", 7) && !rs.active());
+    // word-boundary pattern stays unbounded (falls back to full scan)
+    auto cg = parse("root ::= \"call\" [a-z]+ \"!\"");
+    Triggers wb;
+    wb.patterns = {"\\bcall"};
+    GrammarState ws(cg, wb);
+    CHECK(ws.accept("xcall", 1) && !ws.active());
+    CHECK(ws.accept(" callq", 2) && ws.active() && ws.accept("!", 3) && !ws.active());
 }
 
 // A byte sequence split across tokens: a prefix is fine while some completion can match.
@@ -348,6 +383,27 @@ static void test_partial_utf8() {
     // a continuation byte after a finished character, or a bad lead, is refused
     GrammarState u(any);
     CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));
+    // partial UTF-8 prefixes whose only completions are surrogates (0xED 0xA0..0xBF) or > U+10FFFF (0xF4 0x90..0xBF)
+    // must be rejected before the dead continuation byte so masked sampling cannot deadlock
+    CHECK(!u.allows("\xED\xA0") && !u.allows("\xED\xBF") && u.allows("\xED\x9F"));
+    CHECK(!u.allows("\xF4\x90") && !u.allows("\xF4\xBF") && u.allows("\xF4\x8F"));
+    // negated character class excluding a single non-ASCII code point (or a sub-range): lead bytes that still have
+    // valid unexcluded completions must be allowed across token boundaries and in fill_mask()
+    auto not_e = parse("root ::= [^\\u00e9]");
+    GrammarState ne(not_e);
+    CHECK(ne.allows("\xC3\xA0") && !ne.allows("\xC3\xA9"));
+    CHECK(ne.allows("\xC3"));
+    ne.fill_mask(voc, mask);
+    CHECK(mask[0xC3] && !mask[256]);
+    CHECK(ne.accept("\xC3") && !ne.allows("\xA9") && ne.accept("\xA0") && ne.accepting());
+    // negated class excluding C1 controls (0x80..0x9F): lead byte 0xC2 still allows 0xA0..0xBF
+    auto not_c1 = parse("root ::= [^\\x7f-\\u009f]");
+    GrammarState nc1(not_c1);
+    CHECK(nc1.allows("\xC2") && nc1.accept("\xC2") && !nc1.allows("\x80") && nc1.accept("\xA0") && nc1.accepting());
+    // negated class covering the entire range of lead byte 0xC3 (U+00C0..U+00FF) across two adjacent ranges must reject 0xC3
+    auto not_c3 = parse("root ::= [^\\u00c0-\\u00df\\u00e0-\\u00ff]");
+    GrammarState nc3(not_c3);
+    CHECK(!nc3.allows("\xC3") && nc3.allows("\xC2"));
 }
 
 static double now_us() {

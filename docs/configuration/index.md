@@ -67,6 +67,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `lazy` | server | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
 | `idle-unload` | entry | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
 | `idle-sleep` | entry | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
+| `model-cache-mib` | server | MiB | off | Park a model the router switches away from in RAM, up to this many MiB over all parked models (least recently used out first), so switching back is a RAM copy and not an SSD load. Several models and Linux only. [models](models.md#parking-models-in-ram) |
 | `min-free-vram-mib` | entry | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
 | `grammar` | entry | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
 | `max-payload-mib` | server | MiB | `256` | Largest request body the server reads; a bigger one gets a 413. |
@@ -103,7 +104,7 @@ Command line `--name`; the Where column says which config block takes it.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `vram-reserve-mib` | engine | MiB, at least 256 (128 on Linux) | 700 (lowered to 300 on a card with too few slots) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). |
+| `vram-reserve-mib` | engine | MiB, at least 256 (128 on Linux) | 700 (Flash-Next lowers to 300 on a card with too few slots; unset — 1 GiB — for Inkling-2-Mini) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). Inkling-2-Mini sizes its spill and sessions against the asked reserve and refuses a load that cannot meet it. |
 | `resident-experts` | engine | switch | on with a profile | Flash-Next only. Keep experts the GPU does not hold in page-locked RAM. Falls back to a file mapping when RAM is short. |
 | `resident-budget-gib` | engine | GiB | auto | At most N GiB of experts in RAM, hottest first. |
 | `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. The first rounds after a restart run slower while pages fault in, so drop them from benchmarks. |
