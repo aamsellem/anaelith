@@ -102,9 +102,10 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    // --exp warm_n=N: the experts a warm-up reads, likeliest first (1; 0 turns the warm-up off)
-    const int warm_n = (int) exp_flag("warm_n", 1);
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 && warm_n > 0;
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
+                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
+                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
+                          });
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
@@ -190,13 +191,8 @@ bool Verifier::dm_init(std::string& err) {
         w->rq = std::move(rq4_h);
         w->rs = std::move(rs4_h);
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
-        w->n_read = std::min(warm_n, (int) CpuWarm::kMaxRead);
-        w->bytes.resize(lay.fmt.size());      // a pack's layers may hold experts of different formats
-        w->down_off.resize(lay.fmt.size());
-        for (size_t l = 0; l < lay.fmt.size(); ++l) {
-            w->bytes[l] = lay.fmt[l].bytes;
-            w->down_off[l] = lay.fmt[l].down_off;
-        }
+        w->bytes = lay.fmt[0].bytes;
+        w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
@@ -250,8 +246,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     basalt::log::info("basalt verify", "the MoE tail planned on the device%s", served.c_str());
     if (d->warm != nullptr)
-        basalt::log::info("basalt verify", "the CPU pool warms its %d likeliest next-layer expert%s between doorbells",
-                          d->warm->n_read, d->warm->n_read == 1 ? "" : "s");
+        basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
     return true;
 }
 

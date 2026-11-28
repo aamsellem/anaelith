@@ -115,6 +115,15 @@ class Controls(unittest.TestCase):
             list(svc.run(svc.tok.encode("x"), thinking, None, 16, {"_grammar": {"kind": "json_object"}}, threading.Event()))
             self.assertEqual(svc.engine.requests[-1][1]["_grammar"], want, thinking)
 
+    def test_thinking_off_without_a_grammar_sends_the_one_that_forbids_thinking(self):
+        for thinking, want in ((False, {"kind": "text", "calls": False, "think": False}), (True, None)):
+            svc = service(HEADER + TEXT + "Four." + END)
+            list(svc.run(svc.tok.encode("x"), thinking, None, 16, None, threading.Event()))
+            self.assertEqual((svc.engine.requests[-1][1] or {}).get("_grammar"), want, thinking)
+
+    def test_the_prompt_is_not_prefilled_when_thinking_is_off(self):
+        self.assertTrue(self.prompt(enable_thinking=False).endswith(self.tail))
+
     def test_off_is_the_lowest_effort(self):
         self.assertEqual(self.prompt(enable_thinking=False), EFFORT.format("0") + self.tail)
 
@@ -159,7 +168,7 @@ class Parse(unittest.TestCase):
 
     def test_a_cut_off_call_streams_valid_json(self):
         # what was streamed is closed: a value cut inside a string keeps its text, a dangling key, separator, literal or
-        # escape is dropped, nothing is invented (vLLM #53739)
+        # escape is dropped, nothing is invented
         head = HEADER + "f" + TOOL_JSON + '{"name":"f","args":'
         for cut, want in (('{"s": "hel', {"s": "hel"}), ('{"s": "hello", ', {"s": "hello"}), ('{"n": 42, ', {"n": 42}),
                           ('{"s": "a", "n": tr', {"s": "a"}), ('{"s": "a", "k', {"s": "a"}), ('{"s": "a", "k":', {"s": "a"}),

@@ -14,7 +14,6 @@
 #include <set>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -33,7 +32,9 @@ struct HostPin {
 /// than the device copy into it, and a checkpoint is saved on the request path.  A server reserves the blocks its
 /// checkpoints take at their most before its RAM tier is sized, and the pool keeps that many through a RAM shed.
 /// Reserved blocks are page-locked when a `HostPin` is given, so the copies between them and the device run at link
-/// speed and can be asynchronous; they are handed out first.
+/// speed and can be asynchronous; they are handed out first.  A smaller buffer (a short conversation's state) takes the
+/// front of the smallest reserved piece that holds it, the rest staying in the pool, and gives it back to be joined
+/// with its free neighbours of the same block.
 template <class T>
 struct PooledAlloc {
     using value_type = T;
@@ -51,8 +52,32 @@ struct PooledAlloc {
             size_t at = p.blocks.size();   // a locked block of this size first, else any
             for (size_t i = 0; i < p.blocks.size(); ++i) {
                 if (p.blocks[i].bytes != bytes) continue;
-                if (p.locked.count(p.blocks[i].ptr) > 0) { at = i; break; }
+                if (locked_at(p, p.blocks[i].ptr)) { at = i; break; }
                 if (at == p.blocks.size()) at = i;
+            }
+            if (at == p.blocks.size()) {   // else the smallest reserved piece that holds it, a locked one first
+                for (size_t i = 0; i < p.blocks.size(); ++i) {
+                    const Block& c = p.blocks[i];
+                    if (c.bytes < bytes || !in(p.reserved, c.ptr)) continue;
+                    if (at == p.blocks.size()) { at = i; continue; }
+                    const Block& o = p.blocks[at];
+                    const bool cl = locked_at(p, c.ptr), ol = locked_at(p, o.ptr);
+                    if (cl != ol ? cl : c.bytes < o.bytes) at = i;
+                }
+                if (at < p.blocks.size()) {
+                    Block& c = p.blocks[at];
+                    T* r = static_cast<T*>(c.ptr);
+                    const size_t take = (bytes + kAlign - 1) / kAlign * kAlign;
+                    if (c.bytes - take >= kMinBytes) {   // the rest stays a piece of the pool
+                        c.ptr = static_cast<uint8_t*>(c.ptr) + take;
+                        c.bytes -= take;
+                        p.out[r] = take;
+                    } else {
+                        if (c.bytes != bytes) p.out[r] = c.bytes;
+                        p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) at);
+                    }
+                    return r;
+                }
             }
             if (at < p.blocks.size()) {
                 T* r = static_cast<T*>(p.blocks[at].ptr);
@@ -64,16 +89,34 @@ struct PooledAlloc {
         return static_cast<T*>(::operator new(bytes));
     }
     void deallocate(T* ptr, size_t n) noexcept {
-        const size_t bytes = n * sizeof(T);
+        size_t bytes = n * sizeof(T);
         if (bytes < kMinBytes) {
             ::operator delete(ptr);
             return;
         }
         Pool& p = pool();
         std::lock_guard<std::mutex> lk(p.mu);
+        if (auto it = p.out.find(ptr); it != p.out.end()) {   // a piece: its own bytes
+            bytes = it->second;
+            p.out.erase(it);
+        }
+        if (const auto* r = in(p.reserved, ptr)) {   // joined with the free pieces beside it in its block
+            uint8_t* lo = static_cast<uint8_t*>((void*) ptr);
+            uint8_t* hi = lo + bytes;
+            for (size_t i = p.blocks.size(); i-- > 0;) {
+                uint8_t* b = static_cast<uint8_t*>(p.blocks[i].ptr);
+                if (in(p.reserved, b) != r) continue;
+                if (b + p.blocks[i].bytes == lo) lo = b;
+                else if (b == hi) hi = b + p.blocks[i].bytes;
+                else continue;
+                p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) i);
+            }
+            p.blocks.push_back({lo, (size_t) (hi - lo)});
+            return;
+        }
         size_t kept = 0;   // the blocks kept beyond the reserved ones
-        for (const Block& b : p.blocks) kept += p.reserved.count(b.ptr) == 0;
-        if (p.reserved.count(ptr) > 0 || kept < kMaxBlocks) {
+        for (const Block& b : p.blocks) kept += in(p.reserved, b.ptr) == nullptr;
+        if (kept < kMaxBlocks) {
             p.blocks.push_back({ptr, bytes});
             return;
         }
@@ -106,7 +149,7 @@ struct PooledAlloc {
         std::lock_guard<std::mutex> lk(p.mu);
         for (auto& x : got) {
             p.blocks.push_back({x.first, bytes});
-            p.reserved.insert(x.first);
+            p.reserved.emplace(x.first, bytes);
             if (x.second) {
                 p.locked.emplace(x.first, std::make_pair(pin, bytes));
                 p.locked_total += bytes;
@@ -120,7 +163,7 @@ struct PooledAlloc {
         std::lock_guard<std::mutex> lk(p.mu);
         size_t n = 0;
         for (size_t i = p.blocks.size(); i-- > 0;) {
-            if (p.reserved.count(p.blocks[i].ptr) > 0) continue;
+            if (in(p.reserved, p.blocks[i].ptr)) continue;
             n += p.blocks[i].bytes;
             drop(p, p.blocks[i].ptr);
             p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) i);
@@ -145,11 +188,24 @@ private:
     };
     struct Pool {
         std::mutex mu;
-        std::vector<Block> blocks;
+        std::vector<Block> blocks;   // the free ones (reserved blocks and their pieces among them)
         std::map<void*, std::pair<const HostPin*, size_t>> locked;   // every page-locked block, in the pool or out
         size_t locked_total = 0;
-        std::set<void*> reserved;   // the blocks reserved for checkpoints: always kept, never freed
+        std::map<void*, size_t> reserved;   // the blocks reserved for checkpoints: always kept, never freed
+        std::map<void*, size_t> out;        // pieces handed out, by their bytes, where those differ from what was asked
     };
+    /// The entry of `m` (a block start -> its bytes) whose block holds `ptr`, else null.
+    template <class V>
+    static const std::pair<void* const, V>* in(const std::map<void*, V>& m, const void* ptr) {
+        auto it = m.upper_bound(const_cast<void*>(ptr));
+        if (it == m.begin()) return nullptr;
+        --it;
+        const size_t bytes = bytes_of(it->second);
+        return static_cast<const uint8_t*>(ptr) < static_cast<const uint8_t*>(it->first) + bytes ? &*it : nullptr;
+    }
+    static size_t bytes_of(size_t b) { return b; }
+    static size_t bytes_of(const std::pair<const HostPin*, size_t>& v) { return v.second; }
+    static bool locked_at(const Pool& p, const void* ptr) { return in(p.locked, ptr) != nullptr; }
     static void drop(Pool& p, void* ptr) {
         if (auto it = p.locked.find(ptr); it != p.locked.end()) {
             it->second.first->unpin(ptr);
@@ -330,11 +386,7 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
-/// Parked conversations, matched by their tokens and kept or evicted whole, least recently active first.  `Image` is
-/// what one holds: a RAM image (SavedConversation), or a VRAM one (a model's, with the same live/checkpoints/cvec/
-/// from_slot members and bytes()).
-template <class Image>
-class BasicConversationCache {
+class ConversationCache {
 public:
     struct Match {
         size_t index = 0;
@@ -342,7 +394,7 @@ public:
         bool live = false;
     };
 
-    BasicConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
+    ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
@@ -401,19 +453,11 @@ public:
         return best;
     }
 
-    Image take(size_t index) {
-        Image out = std::move(entries_.at(index));
+    SavedConversation take(size_t index) {
+        SavedConversation out = std::move(entries_.at(index));
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         forget(out);
         return out;
-    }
-
-    /// The longest parked conversation `leaves` accepts, out of the cache (an idle slot's or a budgeted one alike);
-    /// none when it accepts no entry.
-    template<class Fn> std::optional<SavedConversation> take_oldest(Fn leaves) {
-        for (size_t i = 0; i < entries_.size(); ++i)
-            if (leaves(std::as_const(entries_[i]))) return take(i);
-        return std::nullopt;
     }
 
     // Reserve before allocating a snapshot. held is an incoming image removed
@@ -429,7 +473,7 @@ public:
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
     /// RAM), at most `keep` of them; the longest parked leaves first (to the tier below when spilling).
-    void put_slot(Image&& image, size_t keep) {
+    void put_slot(SavedConversation&& image, size_t keep) {
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         while (slot_count_ > 0 && slot_count_ >= keep && evict_oldest(true)) {}
         image.from_slot = true;
@@ -442,7 +486,7 @@ public:
 
     /// With spilling on, what make_room evicts waits in take_spilled() for the tier below (the disk) instead of going.
     void set_spill(bool on) { spill_ = on; }
-    std::vector<Image> take_spilled() { return std::exchange(spilled_, {}); }
+    std::vector<SavedConversation> take_spilled() { return std::exchange(spilled_, {}); }
 
     // Drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
@@ -466,7 +510,7 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                Image gone = std::move(entries_[i]);
+                SavedConversation gone = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 forget(gone);
                 ++dropped;
@@ -494,7 +538,7 @@ public:
         return freed;
     }
 
-    bool put(Image&& image, size_t held = 0) {
+    bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
@@ -508,7 +552,7 @@ public:
 private:
     size_t budgeted_bytes() const { return bytes_ - slot_bytes_ + reuse_.bytes(); }
     // the bookkeeping of an entry that has left `entries_`
-    void forget(const Image& e) {
+    void forget(const SavedConversation& e) {
         const size_t n = e.bytes();
         bytes_ -= n;
         if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
@@ -517,7 +561,7 @@ private:
     bool evict_oldest(bool from_slot) {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].from_slot != from_slot) continue;
-            Image gone = std::move(entries_[i]);
+            SavedConversation gone = std::move(entries_[i]);
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
             forget(gone);
             if (spill_) spilled_.push_back(std::move(gone));
@@ -528,13 +572,11 @@ private:
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     size_t slot_bytes_ = 0, slot_count_ = 0;
-    std::deque<Image> entries_; // least recently active first
+    std::deque<SavedConversation> entries_; // least recently active first
     bool spill_ = false;
-    std::vector<Image> spilled_;
+    std::vector<SavedConversation> spilled_;
     ConversationKvReuse reuse_;
     const void* reuse_owner_ = nullptr;
 };
-
-using ConversationCache = BasicConversationCache<SavedConversation>;
 
 } // namespace basalt::core

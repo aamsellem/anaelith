@@ -1,13 +1,14 @@
-// include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/design/batching.md). A model's session derives
+// include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/architecture/batching.md). A model's session derives
 // BatchSession and writes the hooks below: its rows' inputs to the card, the forward of a window of segments, each session's
 // logits back and its draws. The driver does the rest: the checks, the segments, each session's head rows, the graph of each
 // composition (its first window direct, then captured behind it; the most recently used kept), the order of the streams
 // and one sync for the whole batch. A model whose host steers its forward between launches (experts placed by the host
 // between per-layer graphs) runs its forward directly every window and keeps its own graphs (batch_captured false); a
-// session that cannot batch for now (batch_ready false) has the batch's windows run in turn.
+// session that cannot batch (batch_ready false) has the batch's windows run in turn.
 #pragma once
 
 #include "basalt/core/graph.hpp"
+#include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_window.hpp"
 
@@ -41,7 +42,10 @@ struct BatchShared {
     static constexpr size_t kGraphs = 128;
     static constexpr size_t kSeen = 256;
     GraphLru<core::CapturedGraph> graphs{kGraphs};
+    /// `seen` values: a composition's windows so far ran direct once; or its graph found no device memory.
+    static constexpr uint8_t kSeenOnce = 1, kGraphless = 2;
     GraphLru<uint8_t> seen{kSeen};
+    bool graph_short_noted = false;
 };
 
 class BatchSession : public ModelSession {
@@ -102,8 +106,10 @@ public:
             }
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
-        } else if (!sh.seen.find(key)) {
-            sh.seen.insert(std::move(key), 1u);
+        } else if (uint8_t* seen = sh.seen.find(key); seen == nullptr) {
+            sh.seen.insert(std::move(key), uint8_t(BatchShared::kSeenOnce));
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
+        } else if (*seen == BatchShared::kGraphless) {
             if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else {
             // a composition's first window runs as launched, then is captured for the next ones: the graph is built while
@@ -128,8 +134,21 @@ public:
                 drop();
                 return {Status::Error, who + ": " + err};
             }
-            if (!fresh.end(st, err)) return {Status::Error, who + ": " + err};
-            sh.graphs.insert(std::move(key), std::move(fresh));
+            if (!fresh.end(st, err)) {
+                // the graph's own device memory is what the card is short of: this window ran direct above and the
+                // composition keeps running without a graph; any other failure fails the window
+                if (fresh.status() != cudaErrorMemoryAllocation) return {Status::Error, who + ": " + err};
+                (void) cudaGetLastError();
+                err.clear();
+                if (!sh.graph_short_noted) {
+                    sh.graph_short_noted = true;
+                    basalt::log::warn("basalt batch", "%s: a window's graph found no device memory: windows of its composition run without one",
+                                      who.c_str());
+                }
+                *seen = BatchShared::kGraphless;
+            } else {
+                sh.graphs.insert(std::move(key), std::move(fresh));
+            }
         }
         if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) return {Status::Error, who + ": CUDA: " + cudaGetErrorString(e)};
         // each session its rows back, then its draws, all queued; one sync, then the picks
@@ -154,7 +173,7 @@ public:
     }
 
 protected:
-    // ---- the hooks a model writes (docs/design/batching.md, "Adding batching to a model")
+    // ---- the hooks a model writes (docs/architecture/batching.md, "Adding batching to a model")
 
     /// The error messages' prefix: the model's name.
     virtual const char* batch_name() const = 0;

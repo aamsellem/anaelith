@@ -11,9 +11,7 @@
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
-#include <algorithm>
 #include <atomic>
-#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -128,73 +126,6 @@ std::string Verifier::dm_note() const {
         const std::string ab = basalt::kernels::dec_moe_peer_diag(x.h_w + 32);
         if (!ab.empty()) s += ", its window " + ab;
     }
-    return s;
-}
-
-std::string Verifier::landed_note() const {
-    std::string s;
-    const DecMoe* d = dm_;
-    if (d != nullptr && d->landed != nullptr && d->landed_pin != nullptr) {
-        const OnDevice on_device(device_);
-        const int n = (int) d->rings + 1;
-        uint32_t*& hb = diag_buf_;
-        cudaStream_t& st = diag_st_;
-        s = "; landed words";
-        if (cudaHostAlloc((void**) &hb, (size_t) n * 4, cudaHostAllocPortable) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMemcpyAsync(hb, d->landed, (size_t) n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
-            s += ": the read failed (" + std::string(cudaGetErrorString(cudaGetLastError())) + ")";
-        } else {
-            const Clock::time_point t0 = Clock::now();
-            cudaError_t q;
-            while ((q = cudaStreamQuery(st)) == cudaErrorNotReady && ms_since(t0) < 2000)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (q != cudaSuccess) {
-                s += ": the read did not finish (" + std::string(q == cudaErrorNotReady ? "still queued" : cudaGetErrorString(q)) + ")";
-            } else {
-                const uint32_t need = hb[d->rings];
-                uint32_t lo = UINT32_MAX, hi = 0;
-                int below = 0;
-                std::string ls;
-                for (int i = 0; i < (int) d->rings; ++i) {
-                    lo = std::min(lo, hb[i]);
-                    hi = std::max(hi, hb[i]);
-                    if (hb[i] < need && ++below <= 12) ls += " L" + std::to_string(lb_ + i) + "=" + std::to_string(hb[i]);
-                }
-                s += ": need " + std::to_string(need) + ", words " + std::to_string(lo) + ".." + std::to_string(hi) + ", " +
-                     std::to_string(below) + " layer(s) below the need" + ls;
-            }
-        }
-    }
-    if (fence_ev_ != nullptr) {
-        const OnDevice on_device(device_);
-        const cudaError_t q = cudaEventQuery(fence_ev_);
-        s += std::string("; fence ") + (q == cudaSuccess ? "passed" : q == cudaErrorNotReady ? "pending" : cudaGetErrorString(q));
-    }
-    s += std::string("; post-launch ") + (post_launch_ ? "pending" : "none") + ", ran " + std::to_string(post_runs_) + " times";
-    if (post_runs_ > 0) s += ", last " + std::to_string((long long) ms_since(post_ran_at_)) + " ms ago";
-    if (diag_hook_) s += diag_hook_();
-    return s;
-}
-
-std::string Verifier::landed_after_release() const {
-    std::string s = "; after the release:";
-    const OnDevice on_device(device_);
-    if (diag_st_ != nullptr) {
-        const Clock::time_point t0 = Clock::now();
-        cudaError_t q;
-        while ((q = cudaStreamQuery(diag_st_)) == cudaErrorNotReady && ms_since(t0) < 3000)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        s += " the side read " + std::string(q == cudaSuccess ? "finished" : q == cudaErrorNotReady ? "still queued" : cudaGetErrorString(q));
-        if (q == cudaSuccess && diag_buf_ != nullptr && dm_ != nullptr) {
-            const uint32_t need = diag_buf_[dm_->rings];
-            uint32_t lo = UINT32_MAX, hi = 0;
-            for (int i = 0; i < (int) dm_->rings; ++i) { lo = std::min(lo, diag_buf_[i]); hi = std::max(hi, diag_buf_[i]); }
-            s += " (need " + std::to_string(need) + ", words " + std::to_string(lo) + ".." + std::to_string(hi) + ")";
-        }
-        s += " after " + std::to_string((long long) ms_since(t0)) + " ms";
-    }
-    if (diag_hook_) s += diag_hook_();
     return s;
 }
 

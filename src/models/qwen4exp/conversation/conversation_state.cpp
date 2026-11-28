@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <utility>
 
 namespace basalt::core {
 namespace {
@@ -154,48 +153,22 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
 }
 
 namespace {
-// The running state's five parts, each a packed list of this session's device regions.
-std::array<std::vector<DeviceRegion>, 5> state_regions(const SessionState& ss, const ConversationStateSizes& z) {
-    std::array<std::vector<DeviceRegion>, 5> v;
-    v[0] = {{ss.gdn_state, z.gdn}};
-    v[1] = {{ss.ple_hist, ss.ple_hist ? z.ple : 0}};
-    for (size_t j = 0; j < owned_qsa(ss); ++j) {
-        const auto& st = owned(ss, j);
-        v[2].push_back({st.idx_tail, z.tail});
-        v[3].push_back({st.idx_dead, z.dead});
-        v[4].push_back({st.idx_block_pos, z.block_pos});
-    }
-    return v;
-}
-
-// The same as the checkpoint's five byte parts.
+// The running state as the checkpoint's five byte parts, each a packed list of this session's device regions.
 template <class P, class C>
 std::vector<Segment<P>> state_segments(C& c, const SessionState& ss, const ConversationStateSizes& z) {
-    auto regions = state_regions(ss, z);
-    P* const host[5] = {c.state_a.data(), c.state_b.data(), c.state_c.data(), c.state_d.data(), c.state_e.data()};
     std::vector<Segment<P>> v(5);
-    for (size_t k = 0; k < v.size(); ++k) v[k] = {host[k], std::move(regions[k])};
+    v[0] = {c.state_a.data(), {{ss.gdn_state, z.gdn}}};
+    v[1] = {c.state_b.data(), {{ss.ple_hist, ss.ple_hist ? z.ple : 0}}};
+    v[2].host = c.state_c.data();
+    v[3].host = c.state_d.data();
+    v[4].host = c.state_e.data();
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        const auto& st = owned(ss, j);
+        v[2].regions.push_back({st.idx_tail, z.tail});
+        v[3].regions.push_back({st.idx_dead, z.dead});
+        v[4].regions.push_back({st.idx_block_pos, z.block_pos});
+    }
     return v;
-}
-
-// packed device regions as a reader: copied out on the caller's thread
-ConversationBytes region_bytes(std::vector<DeviceRegion> regions) {
-    ConversationBytes b;
-    for (const DeviceRegion& r : regions) b.size += r.bytes;
-    b.read = [regions = std::move(regions)](uint64_t o, uint8_t* d, uint64_t c) {
-        for (const DeviceRegion& r : regions) {
-            if (c == 0) break;
-            if (o >= r.bytes) { o -= r.bytes; continue; }
-            const uint64_t n = std::min<uint64_t>(c, r.bytes - o);
-            const uint8_t* from = static_cast<const uint8_t*>(r.dev) + o;
-            if (cudaMemcpy(d, from, n, cudaMemcpyDefault) != cudaSuccess) return false;
-            d += n;
-            c -= n;
-            o = 0;
-        }
-        return c == 0;
-    };
-    return b;
 }
 
 void size_parts(ConversationCheckpoint& c, const SessionState& ss, const ConversationStateSizes& z) {
@@ -362,34 +335,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
-bool conversation_snapshot_source(ConversationSource& out, const ConversationView& view, const SessionState& ss,
-                                  const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    if (!view_validate(view, ss, g, error)) return false;
-    ConversationStateSizes z;
-    if (!checkpoint_targets(ss, g, view.ids.size(), z, error) || !sync(error)) return false;
-    ConversationSource s;
-    s.geometry = geometry_key(g);
-    s.layer_lo = ss.layer_lo;
-    s.layer_hi = ss.layer_hi;
-    s.cvec = view.cvec;
-    s.ids = &view.ids;
-    s.imgs = &view.images;
-    for (const auto& c : view.checkpoints) s.checkpoints.push_back(&c);
-    auto regions = state_regions(ss, z);
-    for (size_t k = 0; k < s.live.size(); ++k) s.live[k] = region_bytes(std::move(regions[k]));
-    const int64_t upto = (int64_t) view.ids.size();
-    const size_t layers = owned_qsa(ss);
-    s.kv.resize(layers + (draft ? 1 : 0));
-    for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_source(s.kv[j], owned(ss, j), g, upto, true, error)) return false;
-    if (draft && !conversation_kv_source(s.kv.back(), *draft, g, upto, false, error)) return false;
-    out = std::move(s);
-    return true;
-}
-
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                    const ConversationKvRead* kv) {
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -401,165 +348,22 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
-    if (kv && kv->layers() != image.kv.size()) return fail(error, "invalid K/V layer count in the files");
-    auto layer_ok = [&](size_t j, const QsaState& st, bool index) {
-        if (!kv) return conversation_kv_validate(image.kv[j], st, g, upto, index, error);
-        std::array<uint64_t, 5> payload{};
-        for (int b = 0; b < 5; ++b) payload[(size_t) b] = kv->bytes(j, b);
-        return conversation_kv_validate(image.kv[j], payload, st, g, upto, index, error);
-    };
     for (size_t j = 0; j < layers; ++j)
-        if (!layer_ok(j, owned(ss, j), true)) return false;
-    return !draft || layer_ok(image.kv.size() - 1, *draft, false);
+        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                                   ConversationKvRead* kv) {
-    if (!conversation_snapshot_validate(image, ss, g, draft, error, kv)) return ConversationRestore::invalid;
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
-    if (kv) {
-        std::vector<ConversationKvTarget> targets;
-        for (size_t j = 0; j < owned_qsa(ss); ++j) targets.push_back({&owned(ss, j), true});
-        if (draft) targets.push_back({draft, false});
-        if (!conversation_kv_restore(*kv, targets, g, upto, error) ||
-            !conversation_checkpoint_restore(image.live, ss, g, error))
-            return ConversationRestore::transfer_failed;
-        return ConversationRestore::restored;
-    }
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
             return ConversationRestore::transfer_failed;
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
-}
-
-namespace {
-// The regions a DeviceConversation holds, in save order: the running state (GDN, PLE history, then each owned QSA
-// layer's tail, dead row and block position), then each owned layer's K/V pools and the draft layer's.
-// `check` false: the sizes only.
-bool device_regions(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, int64_t upto, bool check,
-                    std::vector<std::pair<void*, size_t>>& out, std::string& error) {
-    out.clear();
-    ConversationStateSizes z;
-    if (check ? !checkpoint_targets(ss, g, (size_t) upto, z, error) : !conversation_session_sizes(g, ss, z, error))
-        return false;
-    out.emplace_back(ss.gdn_state, z.gdn);
-    out.emplace_back(ss.ple_hist, ss.ple_hist ? z.ple : 0);
-    for (size_t j = 0; j < owned_qsa(ss); ++j) {
-        const auto& st = owned(ss, j);
-        out.emplace_back(st.idx_tail, z.tail);
-        out.emplace_back(st.idx_dead, z.dead);
-        out.emplace_back(st.idx_block_pos, z.block_pos);
-    }
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_regions(owned(ss, j), g, upto, true, out, check, error)) return false;
-    return !draft || conversation_kv_regions(*draft, g, upto, false, out, check, error);
-}
-} // namespace
-
-DeviceConversation& DeviceConversation::operator=(DeviceConversation&& o) noexcept {
-    if (this == &o) return *this;
-    if (mem) cudaFree(mem);
-    live = std::move(o.live);
-    checkpoints = std::move(o.checkpoints);
-    cvec = o.cvec;
-    from_slot = o.from_slot;
-    mem = std::exchange(o.mem, nullptr);
-    sizes = std::move(o.sizes);
-    mem_bytes = std::exchange(o.mem_bytes, 0);
-    layer_lo = o.layer_lo;
-    layer_hi = o.layer_hi;
-    return *this;
-}
-
-DeviceConversation::~DeviceConversation() {
-    if (mem) cudaFree(mem);
-}
-
-size_t conversation_device_bytes(const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
-                                 int64_t tokens) {
-    std::vector<std::pair<void*, size_t>> r;
-    std::string error;
-    if (!device_regions(ss, g, draft, tokens, false, r, error)) return 0;
-    size_t n = 0;
-    for (const auto& x : r)
-        if (!add(n, x.second)) return 0;
-    return n;
-}
-
-bool conversation_device_save(DeviceConversation& image, const ConversationView& view, const SessionState& ss,
-                              const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    std::vector<std::pair<void*, size_t>> r;
-    if (!view_validate(view, ss, g, error) ||
-        !device_regions(ss, g, draft, (int64_t) view.ids.size(), true, r, error) || !sync(error))
-        return false;
-    DeviceConversation out;
-    for (const auto& x : r) {
-        out.sizes.push_back(x.second);
-        if (!add(out.mem_bytes, x.second)) return fail(error, "device image byte count overflow");
-    }
-    if (cudaMalloc(&out.mem, out.mem_bytes) != cudaSuccess) {
-        cudaGetLastError();
-        out.mem = nullptr;
-        return fail(error, "cannot allocate the device image");
-    }
-    size_t at = 0;
-    for (const auto& x : r) {
-        if (!copy(static_cast<uint8_t*>(out.mem) + at, x.first, x.second, error)) return false;
-        at += x.second;
-    }
-    if (!sync(error)) return false;   // a device-to-device copy returns before it lands: the session is written next
-    out.live.ids = view.ids;
-    out.live.imgs = view.images;
-    out.cvec = view.cvec;
-    out.layer_lo = ss.layer_lo;
-    out.layer_hi = ss.layer_hi;
-    image = std::move(out);
-    return true;
-}
-
-ConversationRestore conversation_device_restore(const DeviceConversation& image, SessionState& ss,
-                                                const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    const int64_t upto = (int64_t) image.live.ids.size();
-    std::vector<std::pair<void*, size_t>> r;
-    if (!image.mem || upto < 1) {
-        fail(error, "an empty device image");
-        return ConversationRestore::invalid;
-    }
-    if (!device_regions(ss, g, draft, upto, true, r, error)) return ConversationRestore::invalid;
-    bool same = image.layer_lo == ss.layer_lo && image.layer_hi == ss.layer_hi && r.size() == image.sizes.size();
-    for (size_t i = 0; same && i < r.size(); ++i) same = r[i].second == image.sizes[i];
-    if (!same) {
-        fail(error, "a device image of another layout");
-        return ConversationRestore::invalid;
-    }
-    if (!sync(error)) return ConversationRestore::transfer_failed;
-    size_t at = 0;
-    for (size_t i = 0; i < r.size(); ++i) {
-        if (!copy(r[i].first, static_cast<const uint8_t*>(image.mem) + at, r[i].second, error))
-            return ConversationRestore::transfer_failed;
-        at += r[i].second;
-    }
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_settle(owned(ss, j), g, upto, error)) return ConversationRestore::transfer_failed;
-    if (draft && !conversation_kv_settle(*draft, g, upto, error)) return ConversationRestore::transfer_failed;
-    // as a checkpoint restore leaves it: the indexer's moving row holds the dead row
-    ConversationStateSizes z;
-    if (!conversation_session_sizes(g, ss, z, error)) return ConversationRestore::transfer_failed;
-    const size_t row = (size_t) upto / basalt::kernels::qsa_real_shapes().idx_block;
-    for (size_t j = 0; j < owned_qsa(ss); ++j) {
-        size_t dead_at = image.sizes[0] + image.sizes[1];
-        for (size_t k = 0; k < 3 * j + 1; ++k) dead_at += image.sizes[2 + k];
-        if (!copy(owned(ss, j).idx_pooled + row * g.idx_key_dim, static_cast<const uint8_t*>(image.mem) + dead_at,
-                  z.dead, error))
-            return ConversationRestore::transfer_failed;
-    }
-    ss.ple_prev[0] = upto >= 2 ? image.live.ids[(size_t) upto - 2] : -1;
-    ss.ple_prev[1] = image.live.ids[(size_t) upto - 1];
-    return sync(error) ? ConversationRestore::restored : ConversationRestore::transfer_failed;
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

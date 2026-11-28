@@ -1,7 +1,6 @@
 // src/models/qwen4exp/serve/tiers.cpp - tiers operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
-#include "basalt/core/diag.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -451,15 +450,6 @@ bool QfnRuntime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
-    // A window that waits on its layers' landed words can hold back the very copies that write them: the round's
-    // copies may not run while the window spins on them, and the window then times out.  So the round becomes
-    // resident only once its copies have landed; until then each window keeps the residency it had and this step is
-    // tried again after it.  --exp landed_early=1 restores the earlier step.
-    static const bool landed_early = basalt::core::exp_flag("landed_early", 0) != 0;
-    if (nowait && !landed_early && cudaEventQuery(adapt_ev) == cudaErrorNotReady) {
-        ++xq_landing_waits;
-        return true;
-    }
     if (!nowait && !sync_event(adapt_ev, "adaptive advance sync")) return false;
     if (xq_stage == 1) {
         for (const XSwap& x : xq) {
@@ -508,9 +498,6 @@ bool QfnRuntime::xq_advance(bool wait) {
             }
             pw = w;
         }
-        xq_t1 = std::chrono::steady_clock::now();
-        xq_mode = 0;
-        if (xq_words) ++xq_rounds_words;
         if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
             auto copies = [&, pw] {
                 const auto& lay2 = basalt::kernels::cpu::expert_layout();
@@ -536,13 +523,9 @@ bool QfnRuntime::xq_advance(bool wait) {
             // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
             // waits for that thread to serve its rings: such a round's copies are queued here, before the window
             if (std::all_of(xq.begin(), xq.end(), [&](const XSwap& x) { return x.p2p || srcp->pinned(x.layer, x.in); }))
-            {
-                xq_mode = 1;
                 ver.set_post_launch(std::move(copies));
-            } else {
-                xq_mode = 2;
+            else
                 copies();
-            }
         } else {
             cudaEventRecord(adapt_ev, adapt_stream);
         }
@@ -577,7 +560,6 @@ bool QfnRuntime::xq_advance(bool wait) {
     }
     xq.clear();
     xq_stage = 0;
-    xq_t2 = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -633,9 +615,9 @@ int QfnRuntime::init_tiers() {
     // does not, and where an expert runs depends only on the window count, as with the plain rounds.
     adapt_fast = !multi_gpu;
     // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
-    // (--adapt-decay when given, else 0.95): the routing counts stay large enough for the thresholds and the peer
+    // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
     // margin.
-    fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.95f;   // PROBE adapt sets it
+    fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;   // PROBE adapt sets it
 
     peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
     // the rounds rank over all layers when at most one peer tier holds experts (not exclusively) and every layer's
@@ -663,22 +645,6 @@ int QfnRuntime::init_tiers() {
     // a round made resident before its copies were done: the bookkeeping that waits for them (the next round or
     // a drain), and the RAM pages of its experts
     xq_unsettled = false;
-    ver.set_diag_hook([this] {
-        auto ago = [](std::chrono::steady_clock::time_point t) {
-            return t == std::chrono::steady_clock::time_point{} ? -1.0
-                 : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
-        };
-        auto sq = [](cudaError_t q) { return q == cudaSuccess ? "idle" : q == cudaErrorNotReady ? "busy" : "error"; };
-        char b[480];
-        std::snprintf(b, sizeof b, "; swaps: stage %d, round %u (with words %d, rounds with words %llu), %zu in flight, "
-                      "last copies %s, step 2 %.0f ms ago, step 3 %.0f ms ago, refill stream %s, refill event %s, "
-                      "unsettled %d, swapped %lld, landing waits %lld",
-                      xq_stage, (unsigned) xq_no, (int) xq_words, (unsigned long long) xq_rounds_words, xq.size(),
-                      xq_mode == 1 ? "after the launch" : xq_mode == 2 ? "at once" : "none", ago(xq_t1), ago(xq_t2),
-                      adapt_stream ? sq(cudaStreamQuery(adapt_stream)) : "none",
-                      adapt_ev ? sq(cudaEventQuery(adapt_ev)) : "none", (int) xq_unsettled, (long long) xq_swapped, (long long) xq_landing_waits);
-        return std::string(b);
-    });
     return 0;
 }
 

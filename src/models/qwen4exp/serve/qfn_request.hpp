@@ -19,6 +19,7 @@ public:
     void decode_state_begin();
     void decode_stats_begin();
     int max_window() const { return runtime_.S; }
+    int max_verify_window() const { return max_window(); }
     int draft_window();
     void lookup_window(int& T, bool& from_sfx, int& sfx_match);
     void fill_drafts(int T, bool from_sfx);
@@ -163,7 +164,6 @@ private:
     int64_t decode_hits0{};
     int64_t swapped0{};
     int64_t noplace0{};
-    int64_t landing0{};
     int64_t ram0{};
     int64_t files0{};
     uint64_t file_bytes0{};
@@ -226,7 +226,6 @@ private:
     void validate_incoming() override;
     Flow make_room() override;
     Flow restore_image() override;
-    bool disk_kv_in_files(bool whole) const override;
     void adopt_checkpoints() override;
     void retain_image() override;
     bool session_reset() override;

@@ -31,11 +31,14 @@ protected:
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
     int64_t req_gprompt{};
+    int64_t req_reply{};   ///< reply=N: the first N ids are the prompt, the rest the reply being written (no turn begins there)
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
+    long long req_score{};
+    int req_score_top{};
     int req_clip{};
     int req_logprobs{};   // logprobs=K: a P line ahead of every sent pick, with the K likeliest tokens (-1: off)
     std::vector<float> req_bias{};
@@ -58,6 +61,7 @@ protected:
     bool slot_swapped{};
     bool slot_bound{};
     bool solo_req{};
+    bool batch_first{};   // the batch windows give this request its first token (it reads in its slot, or slot 0 defers its prompt's tail)
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
@@ -74,17 +78,6 @@ protected:
     int own_slot{};
     basalt::core::ConversationCache::Match parked{};
     std::optional<basalt::core::SavedConversation> incoming{};
-    /// The incoming image's K/V while a disk read has left it in its files (see disk_kv_in_files).
-    std::unique_ptr<basalt::core::ConversationKvRead> incoming_kv{};
-    /// The incoming image goes, with what holds its K/V.
-    void drop_incoming() {
-        incoming.reset();
-        incoming_kv.reset();
-    }
-    /// The incoming image came out of the RAM tier, which takes it back when the request ends before restoring it.
-    bool incoming_parked{};
-    /// Puts such an image back where it was parked; true when the RAM tier holds it again.
-    bool repark_incoming();
     int64_t in_tokens{};
     bool in_live{};
     basalt::core::ConversationStore::Match on_disk{};
@@ -127,6 +120,12 @@ protected:
     bool part_checkpoint(int64_t to) const { return to == turn_at || to == root_at || to == media_at; }
     int64_t at{};
     int64_t fold_p0{};
+    /// A batch admission's short prompt part that its slot reads in the batch windows (BSlot::pend): its first position,
+    /// or -1 (read here)
+    int64_t defer_read{-1};
+    /// A text part this short before the prompt's last token is read as decode windows (both the solo request and a batch
+    /// slot, so their replies are the same): many slots' prompts then share one pass over the weights.
+    static constexpr int64_t kWindowReadMax = 128;
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.
@@ -135,7 +134,10 @@ protected:
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
-    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
+    /// Once the prompt is known and fits the context: the room its slot's KV takes (Flow::next: the request does not run now).
+    virtual Flow admit_room() { return Flow::proceed; }
+    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window; `score=N`: the request's
+    /// ids as the stream, its prompt cut to ids[0..N].
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
@@ -180,9 +182,6 @@ protected:
     virtual void validate_incoming() {}
     virtual Flow make_room() { return Flow::proceed; }
     virtual Flow restore_image() { return Flow::proceed; }
-    /// Whether a conversation on disk is read with its K/V left in its files, for restore_image to copy into the
-    /// session from there (incoming_kv); asked with whether RAM admits its whole image.
-    virtual bool disk_kv_in_files(bool) const { return false; }
     virtual void adopt_checkpoints() {}
     virtual void retain_image() {}
     virtual bool session_reset() { return true; }

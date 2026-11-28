@@ -43,35 +43,6 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
-bool Runtime::admit_streamed(uint64_t need, uint64_t floor) {
-    if (capture_admit(need, floor)) return true;
-    if (!disk.enabled() || !conversations) return false;
-    const auto t0 = Clock::now();
-    const auto beat = [] { basalt::core::progress_beat(); };
-    // what holds RAM beside the parked conversations: the K/V kept for the next park, the images on their way to disk
-    (void) conversations->take_reuse();
-    for (auto& sc : conversations->take_spilled())
-        if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
-    disk.flush(beat);
-    const auto moved = basalt::core::conversation_cache_to_store(
-        *conversations, disk, std::max<int64_t>(disk_min_tokens(), o.conversation_cache_min_tokens),
-        [&](const basalt::core::SavedConversation& c) {
-            return disk_has(c.live.ids, c.live.imgs, c.checkpoints, c.cvec);
-        },
-        [&] {   // with what was just given up back at the OS
-            (void) basalt::core::CheckpointBytes::allocator_type::release_pooled();
-            basalt::platform::release_free_heap();
-            return capture_admit(need, floor);
-        },
-        beat);
-    if (moved.left > 0)
-        basalt::log::info("basalt serve", "conversation cache: %zu parked conversations (%zu MiB) leave RAM to admit "
-                          "%llu MiB above the %llu MiB floor, %zu of them written to disk in %.0f ms", moved.left,
-                          moved.bytes >> 20, (unsigned long long) (need >> 20), (unsigned long long) (floor >> 20),
-                          moved.written, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-    return moved.admitted;
-}
-
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;
@@ -110,6 +81,86 @@ void Runtime::keep_check(ConvCheckpoint&& c) {
             continue;
         }
         checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+    }
+    trim_check_pool();
+}
+
+bool Runtime::capture_check(basalt::model::ModelSession& s, int64_t to, ConvCheckpoint::Source source, const int32_t* ids,
+                            std::vector<ImgKey> imgs, ConvCheckpoint& c) {
+    c.source = source;
+    c.ids.assign(ids, ids + to);
+    c.imgs = std::move(imgs);
+    basalt::core::RunningState rs;
+    if (const basalt::model::Result r = s.running_state(to, true, rs); !r.ok()) {
+        err = r.message;
+        return false;
+    }
+    c.state_a.resize(rs.bytes());
+    std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
+    // each card's part on its own device
+    const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
+    if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
+    if (!rs.peer_regions.empty()) {
+        const basalt::core::OnDevice on(rs.peer_device);
+        ckd_peer_dev = rs.peer_device;
+        const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
+        if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
+    }
+    return true;
+}
+
+bool Runtime::slot_turn_checkpoint(int b) {
+    BSlot& sl = bs[(size_t) b];
+    if (o.prompt_cache <= 0) return true;
+    ckd_finish();   // the save before this one lands first
+    ConvCheckpoint c;
+    if (!capture_check(slot_session(b), sl.p, ConvCheckpoint::kTurnEnd, sl.ids.data(), sl.imgs, c)) return false;
+    c.used = ++check_clock;
+    // the slot's shortest checkpoint stays (a system prompt other requests may share); its longest gives way to this one
+    if (sl.checks.size() > 1) {
+        size_t longest = 0;
+        for (size_t i = 1; i < sl.checks.size(); ++i)
+            if (sl.checks[i].ids.size() > sl.checks[longest].ids.size()) longest = i;
+        sl.checks.erase(sl.checks.begin() + (std::ptrdiff_t) longest);
+    }
+    sl.checks.push_back(std::move(c));
+    trim_check_pool();
+    return true;
+}
+
+namespace {
+// A checkpoint's running-state bytes, every card's part.
+uint64_t state_bytes(const ConvCheckpoint& c) {
+    uint64_t n = c.state_a.size() + c.state_b.size() + c.state_c.size() + c.state_d.size() + c.state_e.size();
+    for (const ConvCheckpoint& p : c.stage_parts) n += state_bytes(p);
+    return n;
+}
+}  // namespace
+
+void Runtime::trim_check_pool() {
+    for (;;) {   // the pool every chain shares: the solo session's, the one a request in another slot set aside, every slot's
+        std::vector<std::vector<ConvCheckpoint>*> chains{&checks};
+        if (solo_out != nullptr) chains.push_back(&solo_out->checks);
+        for (BSlot& s : bs) chains.push_back(&s.checks);
+        std::vector<std::vector<uint64_t>> stamps(chains.size());
+        size_t held = 0;
+        uint64_t held_bytes = 0;
+        for (size_t i = 0; i < chains.size(); ++i) {
+            for (const ConvCheckpoint& k : *chains[i]) {
+                stamps[i].push_back(k.used);
+                held_bytes += state_bytes(k);
+            }
+            held += chains[i]->size();
+        }
+        const size_t most = basalt::program::conv_cache::pool_most(o.prompt_cache, o.batch);
+        if (held <= most && (check_bytes == 0 || held_bytes <= check_pool * check_bytes)) return;
+        const auto [chain, at] = basalt::program::conv_cache::pool_victim(stamps);
+        std::vector<ConvCheckpoint>& ch = *chains[chain];
+        if (ch[at].state_a.data() == ckd.pending()) {
+            ckd_finish();   // a failed save drops its own checkpoint: look again
+            continue;
+        }
+        ch.erase(ch.begin() + (std::ptrdiff_t) at);
     }
 }
 

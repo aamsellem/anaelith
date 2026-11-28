@@ -7,8 +7,6 @@
 namespace basalt::models::qwen4exp {
 
 struct Options : CommonOptions {
-    /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
-    std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once, so the SSD stays busy
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
@@ -55,8 +53,6 @@ struct Options : CommonOptions {
     /// Opt-in: the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
-    /// --kv-pool (opt-in, --serve): conversations switched away from stay in VRAM, together within --max-context
-    bool kv_pool = false;
     int64_t vram_segment_mib = 512;
     /// Batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;

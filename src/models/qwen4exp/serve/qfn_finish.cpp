@@ -31,8 +31,6 @@ Flow QfnRequest::complete_begin() {
                                                      " ms/window for it)").c_str());
         const std::string evr = basalt::core::decode_events().report();
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
-        const std::string wr = runtime_.ver.warm_report();
-        if (!wr.empty()) basalt::log::raw("basalt decode warm-up: %s\n", wr.c_str());
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
     }
@@ -109,8 +107,8 @@ void QfnRequest::report_request(const DoneCounts& dc) {
     // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
     if (runtime_.adapt_fast && !runtime_.drive.d.usage.empty())
         basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
-                          "(no free RAM place), %lld windows waited for a round's copies", (long long) (runtime_.xq_swapped - swapped0),
-                          (long long) (runtime_.xq_noplace - noplace0), (long long) (runtime_.xq_landing_waits - landing0));
+                          "(no free RAM place)", (long long) (runtime_.xq_swapped - swapped0),
+                          (long long) (runtime_.xq_noplace - noplace0));
     // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
     // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
     if (runtime_.src.complement_ready())

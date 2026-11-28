@@ -5,9 +5,7 @@
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
-#include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/core/waitpkg.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
@@ -169,7 +167,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
     (void) cudaStreamQuery(cs_);
-    if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; post_ran_at_ = Clock::now(); ++post_runs_; f(); }
+    if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
     gm.mark(15);
     fl_.T = T;
     fl_.pos0 = pos0;
@@ -205,33 +203,11 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
 
 // The host's side of the window: each layer's ring, served as the GPU reaches it.
 bool Verifier::run_serve(PoolMultiFn pool, void* user, std::string& err) {
-    // --exp host_tpause=1: between two polls of the GPU's ring the host thread pauses in C0.2 for about a microsecond
-    // (TPAUSE; the ring is written by the device, which no monitor sees) instead of pausing at full clock.
-    static const bool tpause = exp_flag("host_tpause", 0) != 0 && waitpkg_supported();
     for (;;) {
         const int r = serve_poll(pool, user, err);
         if (r != 0) return r > 0;
-#if BASALT_HAVE_WAITPKG
-        if (tpause) { tpause_for(3000); continue; }
-#endif
         basalt::platform::cpu_relax();
     }
-}
-
-std::string Verifier::warm_report() {
-    if (dm_ == nullptr || dm_->warm == nullptr) return std::string();
-    CpuWarm& w = *dm_->warm;
-    warm_pool_->idle_stop();
-    if (w.st_layers == 0) return std::string();
-    char b[256];
-    const double L = (double) w.st_layers;
-    std::snprintf(b, sizeof b, "%d expert%s read per layer; of %llu layer-windows the selection was done before the layer "
-                  "rang in %.1f%%; %.1f%% of its picks were routed to the CPU (%.2f picks of %.2f CPU experts per "
-                  "layer-window)", w.n_read, w.n_read == 1 ? "" : "s", (unsigned long long) w.st_layers,
-                  100.0 * (double) w.st_ready / L, w.st_picks ? 100.0 * (double) w.st_right / (double) w.st_picks : 0.0,
-                  (double) w.st_right / L, (double) w.st_cpu / L);
-    w.st_layers = w.st_ready = w.st_picks = w.st_right = w.st_cpu = 0;
-    return std::string(b);
 }
 
 int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
@@ -271,9 +247,8 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (now - fl_.wait_t0 > std::chrono::seconds(20)) {
                 // the caller ends the engine; no spin kernel may outlive it
                 const std::string words = dm_note();   // read before the release overwrites them
-                const std::string landed = landed_note();
                 const bool drained = release_gpu_waits(5000);
-                err = "verify: timed out at layer " + std::to_string(l) + words + landed + released_note(drained) + landed_after_release() + peer_released();
+                err = "verify: timed out at layer " + std::to_string(l) + words + released_note(drained) + peer_released();
                 return -1;
             }
             return 0;
@@ -286,10 +261,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
-        if (dm_ != nullptr && dm_->warm != nullptr && k > 0) {   // how this layer's warm-up turned out
-            warm_pool_->idle_stop();
-            warm_note(*dm_->warm, dm_->h_ring[k], (int) ss.k);
-        }
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -334,8 +305,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
             w.arrive.store(0, std::memory_order_relaxed);
             w.ready.store(0, std::memory_order_relaxed);
-            w.n_pick = 0;
-            for (int i = 0; i < CpuWarm::kMaxRead; ++i) { w.blob[i] = nullptr; w.pick[i] = -1; }
+            w.blob = nullptr;
             warm_pool_->idle_start(&warm_job, &w);
         }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();

@@ -148,7 +148,7 @@ void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_
 class QfnRequest;
 class QfnRuntime;
 
-// A batch slot as a session of the shared batch driver (docs/design/batching.md): its windows run on the runtime's
+// A batch slot as a session of the shared batch driver (docs/architecture/batching.md): its windows run on the runtime's
 // verifier over the slot's own state (Verifier::run_slot_segs), a window's kept rows are committed at once (decode_kept),
 // and its drafts come from the drafter's store of the slot, by the drafter's own length rule.
 class QfnSlotSession final : public basalt::model::BatchSession {
@@ -305,9 +305,6 @@ private:
     void* win_pool_user{};
     std::vector<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
-    // --kv-pool: the conversations switched away from, in VRAM; with the live one within --max-context's bytes
-    std::optional<basalt::core::BasicConversationCache<basalt::core::DeviceConversation>> kv_pool{};
-    size_t kv_pool_cap{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
     // the next, so each stage saves its own part when it reaches a checkpoint position (the same rule as the main card's:
     // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
@@ -364,13 +361,6 @@ private:
     uint32_t* xq_pin{};
     cudaEvent_t p2p_ev{};
     bool xq_unsettled{};
-    // stall diagnostics: how the round in flight queued its incoming copies (0 none, 1 after the next launch,
-    // 2 at once) and when its steps ran
-    int xq_mode{};
-    std::chrono::steady_clock::time_point xq_t1{}, xq_t2{};
-    uint64_t xq_rounds_words{};
-    // windows that ran before a round's copies had landed, the round kept for the next one (xq_advance)
-    int64_t xq_landing_waits{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
     int S{};
     int S_mtp{};
@@ -453,13 +443,6 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     bool fixed_experts(basalt::core::VerifyHits& h, int dev);
-    bool capture_admit(uint64_t need, uint64_t floor) override;
-    // The disk tier a buffer at a time: a conversation that goes only to disk is written from the session, and one
-    // on disk that RAM does not admit whole is read with its K/V going from the files into the session.
-    // --exp disk_stream: 0 neither, 2 every read too.
-    int disk_stream{1};
-    uint64_t ram_seen_cap{};   // --exp conv_ram_mib: the most RAM above its floor a conversation's admission sees
-    bool disk_write(const basalt::core::ConversationSource& src, std::string& e);
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
     bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
@@ -490,12 +473,7 @@ private:
     bool peer_take(const std::vector<int32_t>& off, std::string& e);
     void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);
     bool peer_due_apply(std::string& e);
-    bool cache_yield(int64_t add, int64_t room, std::vector<int32_t>& off, std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
-    size_t kv_pool_held(int64_t tokens);
-    bool kv_pool_park(size_t held, int64_t kept);
-    bool kv_pool_swap_in(const std::vector<int32_t>& ids, bool cvec);
-    int64_t kv_pool_evict(int64_t need);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
     uint64_t row_hash(int t);
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
